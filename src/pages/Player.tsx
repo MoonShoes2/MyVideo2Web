@@ -76,6 +76,42 @@ export default function Player() {
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
+
+  // ── 方向记忆：对齐原版 OrientationStore（true = 竖屏片源） ──
+  // 播放器要等元数据才知道画面比例；先按本地记忆定方向，同一部剧下次进来不再翻转闪动。
+  const ORIENTATION_KEY = 'zhuiying.orientation'
+  const readOrientation = (id: number): boolean | null => {
+    try {
+      const map = JSON.parse(localStorage.getItem(ORIENTATION_KEY) || '{}')
+      const v = map[`vod_${id}`]
+      return typeof v === 'boolean' ? v : null
+    } catch {
+      return null
+    }
+  }
+  const rememberOrientation = (id: number, portrait: boolean) => {
+    try {
+      const map = JSON.parse(localStorage.getItem(ORIENTATION_KEY) || '{}')
+      const key = `vod_${id}`
+      if (map[key] === portrait) return
+      map[key] = portrait
+      localStorage.setItem(ORIENTATION_KEY, JSON.stringify(map))
+    } catch {
+      /* 存储不可用时忽略：方向判断退化为每次现场算 */
+    }
+  }
+  const [videoPortrait, setVideoPortrait] = useState<boolean | null>(() => readOrientation(vodId))
+
+  /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
+  const enterLandscape = useCallback(async () => {
+    const el = stageRef.current
+    try {
+      if (el && !document.fullscreenElement) await el.requestFullscreen()
+      await screen.orientation?.lock?.('landscape')
+    } catch {
+      /* 桌面端没有 lock；非用户手势内请求全屏会被拒 */
+    }
+  }, [])
   const hlsRef = useRef<Hls | null>(null)
   const positionRef = useRef(0)
   const durationRef = useRef(0)
@@ -195,6 +231,12 @@ export default function Player() {
 
     const startAt = startPositionMs / 1000
     const onMeta = () => {
+      // 尺寸确定后判定片源方向并记忆（对齐原版 onVideoSizeChanged → OrientationStore）
+      if (video.videoWidth && video.videoHeight) {
+        const portrait = video.videoHeight >= video.videoWidth
+        setVideoPortrait(portrait)
+        rememberOrientation(vodId, portrait)
+      }
       if (startAt > 0 && Math.abs(video.currentTime - startAt) > 1) video.currentTime = startAt
       video.playbackRate = speed
       video.play().catch(() => setNeedsTap(true))
@@ -427,9 +469,44 @@ export default function Player() {
   const toggleFullscreen = () => {
     const el = stageRef.current
     if (!el) return
-    if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined)
-    else el.requestFullscreen?.().catch(() => undefined)
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => undefined)
+    } else {
+      el.requestFullscreen
+        ?.()
+        .then(() => {
+          // 横屏片源锁 landscape，竖屏片源（短剧）锁 portrait
+          if (videoPortrait === false) return screen.orientation?.lock?.('landscape')
+          if (videoPortrait === true) return screen.orientation?.lock?.('portrait')
+        })
+        .catch(() => undefined)
+    }
   }
+
+  // 横屏片源自动转横屏（对齐原版 SCREEN_ORIENTATION_SENSOR_LANDSCAPE）
+  useEffect(() => {
+    if (videoPortrait === false) enterLandscape().catch(() => undefined)
+  }, [videoPortrait, enterLandscape])
+
+  // 离开全屏时解除方向锁；卸载时兜底还原（对齐原版 exitPlayer 回竖屏）
+  useEffect(() => {
+    const unlock = () => {
+      try {
+        screen.orientation?.unlock?.()
+      } catch {
+        /* 未锁定时 unlock 会抛错，忽略 */
+      }
+    }
+    const onFsChange = () => {
+      if (!document.fullscreenElement) unlock()
+    }
+    document.addEventListener('fullscreenchange', onFsChange)
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange)
+      unlock()
+      if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined)
+    }
+  }, [])
 
   const jumpTo = (si: number, ei: number, resumeMs = 0) => {
     const src = sources[si]
@@ -664,6 +741,12 @@ export default function Player() {
           const v = e.currentTarget
           const d = Number.isFinite(v.duration) ? v.duration * 1000 : 0
           setDurationMs(d)
+          // 与播放 effect 里的 onMeta 重复执行是安全的：判定是幂等的
+          if (v.videoWidth && v.videoHeight) {
+            const portrait = v.videoHeight >= v.videoWidth
+            setVideoPortrait(portrait)
+            rememberOrientation(vodId, portrait)
+          }
           if (startPositionMs > 0 && Math.abs(v.currentTime - startPositionMs / 1000) > 1) {
             v.currentTime = startPositionMs / 1000
           }
@@ -702,6 +785,8 @@ export default function Player() {
         <button
           onClick={() => {
             setNeedsTap(false)
+            // 这是全页唯一带用户手势的时刻：横屏片源在这里转横屏全屏成功率最高
+            if (videoPortrait === false) enterLandscape().catch(() => undefined)
             videoRef.current?.play().catch(() => setNeedsTap(true))
           }}
           className="tap absolute inset-0 z-10 flex items-center justify-center"
