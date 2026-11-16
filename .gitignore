@@ -1,0 +1,12 @@
+# 依赖与构建产物（云端构建会重新 npm install + npm run build）
+node_modules/
+dist/
+
+# 本地测试截图与临时产物
+shots/
+*.log
+tsconfig.tsbuildinfo
+
+# 编辑器
+.vscode/
+.idea/
