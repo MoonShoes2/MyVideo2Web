@@ -183,6 +183,13 @@ async function handleHls(url) {
     })
   }
   const text = await r.text()
+  // 死线路常见「200 + 一整页 HTML 错误页」，改写它只会得到一堆垃圾地址
+  if (!text.includes('#EXTM3U')) {
+    return new Response('播放列表无效（上游返回的不是 m3u8），请切换线路', {
+      status: 502,
+      headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+    })
+  }
   const body = rewritePlaylist(text, r.url || target)
   return new Response(body, {
     headers: {

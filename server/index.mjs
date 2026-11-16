@@ -204,6 +204,12 @@ app.get('/api/hls', async (req, res) => {
       return
     }
     const text = await r.text()
+    // 部分采集站的死线路会返回 200 + 一整页 HTML（错误页），
+    // 直接改写会把 HTML 当播放列表，前端只能拿到一堆垃圾地址并卡住。
+    if (!text.includes('#EXTM3U')) {
+      res.status(502).type('text/plain').send('播放列表无效（上游返回的不是 m3u8），请切换线路')
+      return
+    }
     const body = rewritePlaylist(text, r.url || target)
     res
       .type('application/vnd.apple.mpegurl; charset=utf-8')
