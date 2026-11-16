@@ -5,7 +5,7 @@ await page.goto('http://localhost:8787/', { waitUntil: 'networkidle' })
 await page.waitForTimeout(2500)
 const r = await page.evaluate(async () => {
   const regs = await navigator.serviceWorker.getRegistrations()
-  const res = await fetch('/manifest.webmanifest')
+  const res = await fetch('/manifest.json')
   const m = await res.json()
   return {
     secureContext: window.isSecureContext,
