@@ -142,9 +142,19 @@ export function imgUrl(url: string): string {
   return `/api/img?u=${encodeURIComponent(toPlayableUrl(url))}`
 }
 
-/** 播放列表原文（用于广告区间解析）。 */
+/** 播放列表原文（用于广告区间解析）。直连优先，失败回退同源代理。 */
 export async function fetchPlaylistText(url: string): Promise<string> {
-  const res = await fetch(hlsUrl(url))
+  const direct = toPlayableUrl(url)
+  // https 源可直连（源站普遍返回 ACAO: *）；http 源在 https 页面会被混合内容拦截
+  if (/^https:/i.test(direct)) {
+    try {
+      const res = await fetch(direct, { signal: timeoutSignal(8000) })
+      if (res.ok) return await res.text()
+    } catch {
+      /* 直连失败（CORS / 防盗链 / 网络），回退代理 */
+    }
+  }
+  const res = await fetch(hlsUrl(url), { signal: timeoutSignal(15000) })
   if (!res.ok) throw new ApiException(`播放列表加载失败（HTTP ${res.status}）`)
   return res.text()
 }

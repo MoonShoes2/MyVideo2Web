@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Hls from 'hls.js'
 import { db } from '../lib/db'
-import { hlsUrl } from '../lib/api'
+import { hlsUrl, toPlayableUrl } from '../lib/api'
 import {
   cachedDetail,
   fetchDetail,
@@ -116,6 +116,9 @@ export default function Player() {
   }, [])
   const [downloaded, setDownloaded] = useState<Record<number, number[]>>({})
   const [watched, setWatched] = useState<Record<number, Record<number, number>>>({})
+  // 给 hls 挂载 effect 读最新的下载状态（effect 只看 episode.url，不想因下载变化重挂）
+  const downloadedRef = useRef(downloaded)
+  downloadedRef.current = downloaded
 
   const videoRef = useRef<HTMLVideoElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
@@ -321,7 +324,16 @@ export default function Player() {
         fragLoadingMaxRetry: 3,
       })
       hlsRef.current = hls
-      hls.loadSource(hlsUrl(url))
+      // 直连优先：Cloudflare 边缘节点回源国内 CDN 经常几十秒甚至超时，
+      // 而手机直连 CDN 是几百毫秒（且源站返回 ACAO: *）。直连失败（CORS/防盗链/网络）
+      // 再自动回退同源代理。已下载的集必须走代理，否则命中不了离线缓存。
+      const directUrl = toPlayableUrl(url)
+      const proxyUrl = hlsUrl(url)
+      const offlineEpisode = downloadedRef.current[sourceIndex]?.includes(episodeIndex) ?? false
+      // https 页面里请求 http 源属于混合内容，会被浏览器直接拦掉
+      const canDirect = /^https:/i.test(directUrl) && !offlineEpisode
+      let usingDirect = canDirect
+      hls.loadSource(canDirect ? directUrl : proxyUrl)
       hls.attachMedia(video)
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.playbackRate = speed
@@ -332,12 +344,23 @@ export default function Player() {
       let mediaRetries = 0
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries++ < 2) {
-          hls.startLoad()
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries++ < 2) {
-          hls.recoverMediaError()
-        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          // 直连失败：先回退代理再重试，这一步能救回大多数被墙/被防盗链的源
+          if (usingDirect) {
+            usingDirect = false
+            hls.loadSource(proxyUrl)
+            hls.startLoad()
+            return
+          }
+          if (networkRetries++ < 2) {
+            hls.startLoad()
+            return
+          }
           setPlaybackError(describePlaybackError('network'))
+          return
+        }
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries++ < 2) {
+          hls.recoverMediaError()
         } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
           setPlaybackError(describePlaybackError('media'))
         } else {
@@ -357,7 +380,8 @@ export default function Player() {
       hlsRef.current = null
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [episode?.url, playToken])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [episode?.url, playToken, sourceIndex, episodeIndex])
 
   // ── 播放器事件 ──
   // 关键：初次渲染是「正在获取播放地址」全屏加载页，<video> 还没挂载，
