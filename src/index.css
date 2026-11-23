@@ -84,7 +84,9 @@
 
   body {
     margin: 0;
-    background: #08090c;
+    /* 跟随主题：刘海/状态栏等露出 body 的区域要与 App 背景一致（原来硬编码 #08090c，
+       浅色模式下会露出一条黑边，看起来和 App 不统一）。桌面端黑边见下方 media。 */
+    background: var(--bg);
     color: var(--text);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
       'Microsoft YaHei', 'Source Han Sans SC', sans-serif;
@@ -167,6 +169,11 @@
   height: 100dvh;
   margin: 0 auto;
   background: var(--bg);
+  /* 状态栏是 black-translucent（内容延伸），必须自己让出安全区：
+     否则首页标题 / 二级页返回键会被时间、电量图标压住。padding 区域显示 var(--bg)，
+     与页面背景天然一致，这就是「状态栏和 App 统一」的关键。 */
+  padding-top: env(safe-area-inset-top, 0px);
+  box-sizing: border-box;
   overflow: hidden;
   display: flex;
   flex-direction: column;
@@ -175,6 +182,10 @@
 @media (min-width: 640px) {
   .app-shell {
     box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.06), 0 24px 80px rgba(0, 0, 0, 0.55);
+  }
+  /* 桌面端保留「手机壳」影院黑边，手机端用主题背景与 App 融为一体 */
+  body {
+    background: #08090c;
   }
 }
 
