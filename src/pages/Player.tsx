@@ -25,6 +25,21 @@ import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
 
+/** 是否以「已安装应用」方式运行（从桌面图标打开），而不是浏览器标签页。 */
+function isInstalledPwa(): boolean {
+  try {
+    return (
+      window.matchMedia('(display-mode: fullscreen)').matches ||
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.matchMedia('(display-mode: minimal-ui)').matches ||
+      // iOS 加到主屏幕后没有 display-mode，靠这个标记
+      (navigator as unknown as { standalone?: boolean }).standalone === true
+    )
+  } catch {
+    return false
+  }
+}
+
 const BOOST_SPEED = 2
 /** 起播无进展上限：连续这么久拿不到任何新数据才判超时（有进展会不断续命）。 */
 const STARTUP_STALL_MS = 20_000
@@ -159,6 +174,11 @@ export default function Player() {
   }
   const [videoPortrait, setVideoPortrait] = useState<boolean | null>(() => readOrientation(vodId))
 
+  // 是否以「已安装应用」运行：这决定全屏/转屏逻辑要不要插手。
+  // 安装态窗口本身就是全屏，任何额外的 requestFullscreen / orientation.lock
+  // 都会引起窗口尺寸变化，正是 PWA 独有的那部分差异。
+  const installedPwa = isInstalledPwa()
+  const pendingLandscapeRef = useRef(false)
   // 是否真正进入过全屏：比 videoPortrait 更可靠的「横屏播放中」信号，
   // 拿不到视频宽高时也能正确识别系统返回键退出全屏。
   const wasFullscreenRef = useRef(false)
@@ -169,21 +189,25 @@ export default function Player() {
   /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
   const enterLandscape = useCallback(async () => {
     const el = stageRef.current
-    // 以 PWA 方式安装后（fullscreen/standalone），窗口本身已是全屏，
-    // 再请求元素全屏在部分机型上会立即被系统收回并触发 fullscreenchange，
-    // 反而把播放页误判成「退出全屏」而卡住。这种模式只锁方向即可。
-    const standalone =
-      window.matchMedia('(display-mode: fullscreen)').matches ||
-      window.matchMedia('(display-mode: standalone)').matches
+    // 「网页正常、装成 PWA 就不对」的根源就在这段：
+    // 浏览器标签页里 requestFullscreen 会被拒、orientation.lock 也就跟着失败，
+    // 所以什么都没发生；而安装成 PWA 后窗口本身已是全屏，lock 会真的生效——
+    // 它会在「元数据刚就绪、首个分片还在灌」的瞬间把窗口转成横屏，
+    // Android 因此重建 video 的渲染表面，首帧迟迟拿不到，
+    // 表现就是「进度条出来了、圈一直转、永远不进画面」。
+    // 所以安装态先不转，等首帧真正渲染出来再转（见下面的 pendingLandscape 效应）。
+    if (installedPwa) {
+      pendingLandscapeRef.current = true
+      return
+    }
     try {
-      if (el && !standalone && !document.fullscreenElement) await el.requestFullscreen()
-      // 只有真的用到元素全屏时才记录，standalone 下靠系统返回键直接退路由
-      if (!standalone) wasFullscreenRef.current = true
+      if (el && !document.fullscreenElement) await el.requestFullscreen()
+      wasFullscreenRef.current = true
       await screen.orientation?.lock?.('landscape')
     } catch {
       /* 桌面端没有 lock；非用户手势内请求全屏会被拒 */
     }
-  }, [])
+  }, [installedPwa])
   const hlsRef = useRef<Hls | null>(null)
   const tailAdHandledRef = useRef(false)
   const positionRef = useRef(0)
@@ -768,6 +792,9 @@ export default function Player() {
       }
     }
     const onFsChange = () => {
+      // 安装态窗口本身就在全屏里，它的 fullscreenchange 不代表用户按了返回，
+      // 不能据此退出播放页（否则转屏一次就把人踢回详情页）。
+      if (installedPwa) return
       if (document.fullscreenElement) {
         // 进入全屏（横屏片源自动转的），记下来；系统返回键退出时据此判断
         wasFullscreenRef.current = true
@@ -785,7 +812,16 @@ export default function Player() {
     document.addEventListener('fullscreenchange', onFsChange)
     return () => document.removeEventListener('fullscreenchange', onFsChange)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leavePlayer, videoPortrait, vod, loading])
+  }, [leavePlayer, videoPortrait, vod, loading, installedPwa])
+
+  // 安装态：首帧真正渲染出来之后才转横屏。
+  // 转屏会重建 video 的渲染表面，放在起播前做会让首帧永远等不到。
+  useEffect(() => {
+    if (!installedPwa || !firstFrame || !pendingLandscapeRef.current) return
+    pendingLandscapeRef.current = false
+    const p = screen.orientation?.lock?.('landscape')
+    if (p && typeof p.catch === 'function') p.catch(() => undefined)
+  }, [installedPwa, firstFrame])
 
   // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
   useEffect(() => {
