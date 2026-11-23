@@ -185,14 +185,35 @@ export default function Player() {
   // 主动离开标记：顶栏返回 / 组件卸载时我们主动退出全屏，
   // fullscreenchange 会因此再触发一次，用这个标记避免重复 navigate。
   const leavingRef = useRef(false)
-  // 当前是否横屏：只用于决定按钮文案（旋转 / 竖屏）和切换方向
-  const [landscapeView, setLandscapeView] = useState(false)
+  // 设备当前角度：0 竖屏 / 90、270 横屏 / 180 倒竖屏
+  const [deviceAngle, setDeviceAngle] = useState(0)
+  /**
+   * 手动「旋转」。
+   *
+   * 不再调用 screen.orientation.lock()：安装成 PWA 后窗口本身就是全屏，
+   * 这句会让**整个窗口**旋转并重新布局，Android 随之重建 video 的渲染表面，
+   * 实测点一下就直接卡死（进度条也一起不响应）。
+   * 改成把播放器整体 CSS 旋转 90°：视觉上立刻变横向，窗口和渲染表面完全不动。
+   */
+  const [theater, setTheater] = useState(false)
   useEffect(() => {
-    const sync = () => setLandscapeView((screen.orientation?.type ?? '').startsWith('landscape'))
-    sync()
-    screen.orientation?.addEventListener?.('change', sync)
-    return () => screen.orientation?.removeEventListener?.('change', sync)
+    const read = () => {
+      const type = screen.orientation?.type ?? ''
+      if (type.startsWith('landscape')) setDeviceAngle(type.includes('secondary') ? 270 : 90)
+      else setDeviceAngle(type.includes('secondary') ? 180 : 0)
+    }
+    read()
+    screen.orientation?.addEventListener?.('change', read)
+    window.addEventListener('orientationchange', read)
+    return () => {
+      screen.orientation?.removeEventListener?.('change', read)
+      window.removeEventListener('orientationchange', read)
+    }
   }, [])
+  // 让画面在重力坐标系里始终是横向：竖屏时转 90°，用户把手机横过来后自动补回 0°
+  const stageRotation = theater ? (90 - deviceAngle + 360) % 360 : 0
+  // 只有在「横屏片源 + 当前竖屏」时才需要这个按钮
+  const canRotate = videoPortrait === false && deviceAngle % 180 !== 90
 
   const hlsRef = useRef<Hls | null>(null)
   const tailAdHandledRef = useRef(false)
@@ -216,45 +237,10 @@ export default function Player() {
     toastTimer.current = window.setTimeout(() => setToast(null), 2000)
   }, [])
 
-  /**
-   * 手动转屏：横屏 ↔ 竖屏。
-   *
-   * 原来是「横屏片源自动转」，但装成 PWA 后窗口本身就是全屏，转屏会让整个窗口
-   * 重新布局、Android 随之重建 video 的渲染表面；在灌首片的瞬间做这件事会把首帧
-   * 卡死（浏览器标签页里没这个毛病，因为那时 requestFullscreen 常常直接被拒）。
-   * 所以改成完全手动：转不转、什么时候转，由用户决定。
-   */
-  const toggleOrientation = useCallback(async () => {
-    const el = stageRef.current
-    try {
-      if (landscapeView) {
-        manualUnlockRef.current = true
-        try {
-          screen.orientation?.unlock?.()
-        } catch {
-          /* 没有锁定过时 unlock 会抛，忽略 */
-        }
-        if (!installedPwa && document.fullscreenElement) {
-          await document.exitFullscreen().catch(() => undefined)
-        }
-        showToast('已切回竖屏')
-        return
-      }
-      // 浏览器标签页里要先进元素全屏，锁方向才有意义；PWA 窗口本身已全屏
-      if (!installedPwa && el && !document.fullscreenElement) {
-        await el.requestFullscreen()
-        wasFullscreenRef.current = true
-      }
-      manualUnlockRef.current = false
-      if (!screen.orientation?.lock) {
-        showToast('请把手机横过来')
-        return
-      }
-      await screen.orientation.lock('landscape')
-    } catch {
-      showToast('这个环境不支持自动旋转，请把手机横过来')
-    }
-  }, [landscapeView, installedPwa, showToast])
+  /** 手动旋转：纯视觉旋转，不碰系统方向（避免 PWA 整窗转屏把画面卡死）。 */
+  const toggleOrientation = useCallback(() => {
+    setTheater((v) => !v)
+  }, [])
 
   // ── 初始加载：最新的直链 → 下载索引 → 详情缓存，三级兜底 ──
   useEffect(() => {
@@ -1121,7 +1107,21 @@ export default function Player() {
     <div
       ref={stageRef}
       className="fixed inset-0 z-50 select-none bg-black"
-      style={{ cursor: controlsVisible ? 'default' : 'none' }}
+      style={{
+        cursor: controlsVisible ? 'default' : 'none',
+        // 手动横屏：整体旋转，长宽互换，绕中心转，视觉上正好铺满
+        ...(stageRotation
+          ? {
+              left: '50%',
+              top: '50%',
+              right: 'auto',
+              bottom: 'auto',
+              width: stageRotation % 180 === 0 ? '100vw' : '100vh',
+              height: stageRotation % 180 === 0 ? '100vh' : '100vw',
+              transform: `translate(-50%, -50%) rotate(${stageRotation}deg)`,
+            }
+          : null),
+      }}
     >
       <video
         ref={videoRef}
@@ -1314,8 +1314,10 @@ export default function Player() {
                 onNext={() => nextEpisode()}
                 onSpeed={() => setSpeedMenuOpen((v) => !v)}
                 onPlaylist={() => setPanelOpen(true)}
-                onRotate={() => void toggleOrientation()}
-                landscape={landscapeView}
+                onRotate={toggleOrientation}
+                landscape={theater}
+                canRotate={canRotate}
+                rotation={stageRotation}
               />
             </div>
           )}
@@ -1328,6 +1330,7 @@ export default function Player() {
                 durationMs={durationMs}
                 bufferedMs={bufferedMs}
                 onSeek={() => undefined}
+                rotation={stageRotation}
               />
               <div className="-mt-1 flex items-center justify-between text-label-md text-white/85">
                 <span>{playbackText(seekPreview)}</span>
@@ -1429,6 +1432,8 @@ function PlayerBottomBar({
   onPlaylist,
   onRotate,
   landscape,
+  canRotate,
+  rotation,
 }: {
   positionMs: number
   durationMs: number
@@ -1443,6 +1448,8 @@ function PlayerBottomBar({
   onPlaylist: () => void
   onRotate: () => void
   landscape: boolean
+  canRotate: boolean
+  rotation: number
 }) {
   return (
     <div className="bg-gradient-to-t from-black/80 to-transparent px-3.5 pt-5 pb-2.5 text-white">
@@ -1451,6 +1458,7 @@ function PlayerBottomBar({
         durationMs={durationMs}
         bufferedMs={bufferedMs}
         onSeek={onSeek}
+        rotation={rotation}
       />
       <div className="flex items-center">
         <span className="text-label-md">{playbackText(positionMs)}</span>
@@ -1470,29 +1478,39 @@ function PlayerBottomBar({
         </button>
         <div className="w-2" />
         <ControlIcon name="playlist" label="选集" onClick={onPlaylist} />
-        <button
-          onClick={onRotate}
-          className="tap ml-1 rounded-md bg-white/15 px-2 py-1 text-label-md"
-          aria-label={landscape ? '切回竖屏' : '横屏播放'}
-        >
-          {landscape ? '竖屏' : '旋转'}
-        </button>
+        {canRotate && (
+          <button
+            onClick={onRotate}
+            className="tap ml-1 rounded-md bg-white/15 px-2 py-1 text-label-md"
+            aria-label={landscape ? '切回竖屏' : '横屏播放'}
+          >
+            {landscape ? '竖屏' : '旋转'}
+          </button>
+        )}
       </div>
     </div>
   )
 }
 
 /** 进度条：视觉 3px、触摸区 22px；已缓冲段与已播放段分开画。 */
+/**
+ * 进度条：视觉 3px、触摸区 22px。
+ *
+ * `touch-none` 不能省：手机上按住拖动时，浏览器默认会把这串触摸当成页面滚动手势，
+ * 触发 pointercancel 后我们的拖动状态被清掉，表现就是「进度条拖不动」。
+ */
 function PlayerProgress({
   positionMs,
   durationMs,
   bufferedMs,
   onSeek,
+  rotation,
 }: {
   positionMs: number
   durationMs: number
   bufferedMs: number
   onSeek: (ms: number) => void
+  rotation: number
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = useState(false)
@@ -1500,30 +1518,42 @@ function PlayerProgress({
   const ratio = durationMs > 0 ? Math.min(1, Math.max(0, (dragging ? preview : positionMs) / durationMs)) : 0
   const bufferedRatio = durationMs > 0 ? Math.min(1, bufferedMs / durationMs) : 0
 
-  const valueAt = (clientX: number) => {
+  /**
+   * 把指针位置换算成进度值。
+   *
+   * 手动横屏是把整个播放器 CSS 旋转的，进度条在屏幕坐标系里就变成了竖向，
+   * 此时仍用 clientX 会算出完全错误的值，所以要按当前旋转角度挑轴、必要时反向。
+   */
+  const valueAt = (clientX: number, clientY: number) => {
     const el = ref.current
     if (!el || durationMs <= 0) return 0
     const rect = el.getBoundingClientRect()
-    return Math.min(durationMs, Math.max(0, ((clientX - rect.left) / rect.width) * durationMs))
+    const angle = ((rotation % 360) + 360) % 360
+    let ratio: number
+    if (angle === 90) ratio = (clientY - rect.top) / rect.height
+    else if (angle === 270) ratio = (rect.bottom - clientY) / rect.height
+    else if (angle === 180) ratio = (rect.right - clientX) / rect.width
+    else ratio = (clientX - rect.left) / rect.width
+    return Math.min(durationMs, Math.max(0, ratio * durationMs))
   }
 
   return (
     <div
       ref={ref}
-      className="relative h-[22px] w-full cursor-pointer"
+      className="relative h-[22px] w-full cursor-pointer touch-none"
       onPointerDown={(e) => {
         if (durationMs <= 0) return
         ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
         setDragging(true)
-        setPreview(valueAt(e.clientX))
+        setPreview(valueAt(e.clientX, e.clientY))
       }}
       onPointerMove={(e) => {
         if (!dragging) return
-        setPreview(valueAt(e.clientX))
+        setPreview(valueAt(e.clientX, e.clientY))
       }}
       onPointerUp={(e) => {
         if (!dragging) return
-        const target = valueAt(e.clientX)
+        const target = valueAt(e.clientX, e.clientY)
         setDragging(false)
         onSeek(target)
       }}
