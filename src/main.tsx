@@ -29,7 +29,7 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       // 版本号：每次改动 sw.js 都升一下，避开边缘缓存导致的「旧 SW 不更新」。
-      .register('/sw.js?v=20261123b')
+      .register('/sw.js?v=20261123c')
       .then((reg) => {
         // 主动检查更新，避免等浏览器按自己的节奏才拉新版本
         reg.update().catch(() => undefined)

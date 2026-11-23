@@ -142,6 +142,26 @@ export function imgUrl(url: string): string {
   return `/api/img?u=${encodeURIComponent(toPlayableUrl(url))}`
 }
 
+/**
+ * 起播前快速探测：这个播放列表地址现在到底能不能拿到。
+ *
+ * 之前是「先直连、等 hls.js 自己超时 15s 再回退代理、代理再挂 30s」，
+ * 用户看到的就是几十秒的转圈。这里用一次 3.5 秒的小请求先定路线，
+ * 之后 loadSource 直接走确定能通的那条。
+ */
+export async function probePlaylist(url: string, timeoutMs = 3500): Promise<boolean> {
+  try {
+    const res = await fetch(url, {
+      signal: timeoutSignal(timeoutMs),
+      mode: 'cors',
+      cache: 'no-store',
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 /** 播放列表原文（用于广告区间解析）。直连优先，失败回退同源代理。 */
 export async function fetchPlaylistText(url: string): Promise<string> {
   const direct = toPlayableUrl(url)

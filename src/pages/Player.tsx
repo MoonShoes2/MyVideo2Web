@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Hls from 'hls.js'
 import { db } from '../lib/db'
-import { hlsUrl, toPlayableUrl } from '../lib/api'
+import { hlsUrl, probePlaylist, toPlayableUrl } from '../lib/api'
 import {
   cachedDetail,
   fetchDetail,
@@ -20,11 +20,16 @@ import {
 import { offlineVod } from '../lib/downloads'
 import { resolveAdRanges, inRange, type AdRange } from '../lib/ads'
 import { getSettings, PLAYER_SPEED_OPTIONS, useSettings } from '../lib/settings'
+import { BUILD_TAG } from '../lib/version'
 import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
 
 const BOOST_SPEED = 2
+/** 起播硬上限：超过这个时间还没画面就给用户出口，不能无限转圈。 */
+const STARTUP_TIMEOUT_MS = 20_000
+/** 直连路线探测时长：超时就当直连不通，直接走同源代理。 */
+const DIRECT_PROBE_TIMEOUT_MS = 3_500
 const BOOST_DELAY_MS = 450
 const CONTROLS_AUTO_HIDE_MS = 4000
 const PROGRESS_SAVE_INTERVAL_MS = 5000
@@ -310,6 +315,15 @@ export default function Player() {
     }
     video.addEventListener('loadedmetadata', onMeta, { once: true })
 
+    // 起播看门狗：20 秒还没拿到任何画面数据，就直接给用户可以操作的出口。
+    // 没有它的话，上游一直不返回时会永远停在「正在获取播放地址」（用户说的「卡死」）。
+    let cancelled = false
+    const watchdog = window.setTimeout(() => {
+      if (cancelled) return
+      if (video.readyState >= 2 || video.currentTime > 0) return
+      setPlaybackError('播放超时，地址可能已失效，试试切换线路')
+    }, STARTUP_TIMEOUT_MS)
+
     if (Hls.isSupported()) {
       const hls = new Hls({
         maxBufferLength: 30,
@@ -333,8 +347,16 @@ export default function Player() {
       // https 页面里请求 http 源属于混合内容，会被浏览器直接拦掉
       const canDirect = /^https:/i.test(directUrl) && !offlineEpisode
       let usingDirect = canDirect
-      hls.loadSource(canDirect ? directUrl : proxyUrl)
       hls.attachMedia(video)
+      // 先探测路线再 loadSource：直连能通就走直连（手机端几百毫秒），
+      // 不通立刻改走代理。不再让 hls.js 自己耗 15 秒超时才发现要回退。
+      void (async () => {
+        if (canDirect && !(await probePlaylist(directUrl, DIRECT_PROBE_TIMEOUT_MS))) {
+          usingDirect = false
+        }
+        if (cancelled) return
+        hls.loadSource(usingDirect ? directUrl : proxyUrl)
+      })()
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.playbackRate = speed
         video.play().catch(() => setNeedsTap(true))
@@ -375,6 +397,8 @@ export default function Player() {
     }
 
     return () => {
+      cancelled = true
+      window.clearTimeout(watchdog)
       video.removeEventListener('loadedmetadata', onMeta)
       hlsRef.current?.destroy()
       hlsRef.current = null
@@ -925,7 +949,7 @@ export default function Player() {
       <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black">
         <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
         <p className="mt-4 text-body-md text-white/70">
-          正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s)` : ''}
+          正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
         </p>
       </div>
     )
@@ -1040,7 +1064,7 @@ export default function Player() {
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-black">
           <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
           <p className="mt-4 text-body-md text-white/70">
-            正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s)` : ''}
+            正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
           </p>
         </div>
       )}
