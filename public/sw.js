@@ -22,13 +22,31 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(request.url)
   if (url.origin !== self.location.origin) return
 
-  const isMedia = url.pathname === '/api/hls' || url.pathname === '/api/seg'
-  if (isMedia) {
+  // 播放列表：必须网络优先。m3u8 里的分片地址带签名、会过期，
+  // 命中旧缓存会让 hls.js 一直去拉失效地址，表现就是「播放卡死」。
+  if (url.pathname === '/api/hls') {
+    event.respondWith(
+      (async () => {
+        try {
+          return await fetch(request)
+        } catch {
+          const cache = await caches.open(MEDIA_CACHE)
+          const hit = await cache.match(request, { ignoreVary: true })
+          return hit || new Response('离线且未缓存播放列表', { status: 504 })
+        }
+      })(),
+    )
+    return
+  }
+
+  // 分片：缓存优先（下载器写入的离线分片），但只认成功响应，
+  // 避免中断下载留下的坏条目被当成有效数据反复返回。
+  if (url.pathname === '/api/seg') {
     event.respondWith(
       (async () => {
         const cache = await caches.open(MEDIA_CACHE)
         const hit = await cache.match(request, { ignoreVary: true })
-        if (hit) return hit
+        if (hit && hit.ok && (hit.headers.get('content-length') ?? '1') !== '0') return hit
         try {
           return await fetch(request)
         } catch {

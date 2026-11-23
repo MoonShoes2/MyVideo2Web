@@ -149,9 +149,16 @@ export default function Player() {
   /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
   const enterLandscape = useCallback(async () => {
     const el = stageRef.current
+    // 以 PWA 方式安装后（fullscreen/standalone），窗口本身已是全屏，
+    // 再请求元素全屏在部分机型上会立即被系统收回并触发 fullscreenchange，
+    // 反而把播放页误判成「退出全屏」而卡住。这种模式只锁方向即可。
+    const standalone =
+      window.matchMedia('(display-mode: fullscreen)').matches ||
+      window.matchMedia('(display-mode: standalone)').matches
     try {
-      if (el && !document.fullscreenElement) await el.requestFullscreen()
-      wasFullscreenRef.current = true
+      if (el && !standalone && !document.fullscreenElement) await el.requestFullscreen()
+      // 只有真的用到元素全屏时才记录，standalone 下靠系统返回键直接退路由
+      if (!standalone) wasFullscreenRef.current = true
       await screen.orientation?.lock?.('landscape')
     } catch {
       /* 桌面端没有 lock；非用户手势内请求全屏会被拒 */
