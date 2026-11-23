@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import Hls from 'hls.js'
 import { db } from '../lib/db'
-import { hlsUrl, probePlaylist, toPlayableUrl } from '../lib/api'
+import { hlsUrl, toPlayableUrl } from '../lib/api'
 import {
   cachedDetail,
   fetchDetail,
@@ -25,26 +25,7 @@ import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
 
-/** 是否以「已安装应用」方式运行（从桌面图标打开），而不是浏览器标签页。 */
-function isInstalledPwa(): boolean {
-  try {
-    return (
-      window.matchMedia('(display-mode: fullscreen)').matches ||
-      window.matchMedia('(display-mode: standalone)').matches ||
-      window.matchMedia('(display-mode: minimal-ui)').matches ||
-      // iOS 加到主屏幕后没有 display-mode，靠这个标记
-      (navigator as unknown as { standalone?: boolean }).standalone === true
-    )
-  } catch {
-    return false
-  }
-}
-
 const BOOST_SPEED = 2
-/** 起播无进展上限：连续这么久拿不到任何新数据才判超时（有进展会不断续命）。 */
-const STARTUP_STALL_MS = 20_000
-/** 直连路线探测时长：超时就当直连不通，直接走同源代理。 */
-const DIRECT_PROBE_TIMEOUT_MS = 3_500
 const BOOST_DELAY_MS = 450
 const CONTROLS_AUTO_HIDE_MS = 4000
 const PROGRESS_SAVE_INTERVAL_MS = 5000
@@ -74,9 +55,8 @@ function describeMediaError(code?: number): string {
     case 1:
       return '播放被中断，请重试'
     case 2:
-    case 4:
-      return describePlaybackError('media')
     case 3:
+    case 4:
       return describePlaybackError('media')
     default:
       return describePlaybackError('other')
@@ -125,21 +105,10 @@ export default function Player() {
   const [brightness, setBrightness] = useState(1)
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
   const [adRanges, setAdRanges] = useState<AdRange[]>([])
-  const [adSkipping, setAdSkipping] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [needsTap, setNeedsTap] = useState(false)
-  // 起播等待秒数：秒数在跳 = 网络在等；秒数冻结 = 主线程/渲染进程卡死（诊断用）
+  // 起播等待秒数：超过 3 秒把 BUILD_TAG 一起显示出来，超过 8 秒给一个手动出口。
   const [elapsedSec, setElapsedSec] = useState(0)
-  useEffect(() => {
-    const timer = window.setInterval(() => setElapsedSec((v) => v + 1), 1000)
-    return () => window.clearInterval(timer)
-  }, [])
-  // 起播阶段日志：卡住时把「走到哪一步」显示出来，不用再靠猜。
-  // 日志也不动了 = 进程已经死，而不是网络在等。
-  const [stages, setStages] = useState<string[]>([])
-  const markStage = useCallback((s: string) => {
-    setStages((prev) => (prev[prev.length - 1] === s ? prev : [...prev.slice(-3), s]))
-  }, [])
   const [downloaded, setDownloaded] = useState<Record<number, number[]>>({})
   const [watched, setWatched] = useState<Record<number, Record<number, number>>>({})
   // 给 hls 挂载 effect 读最新的下载状态（effect 只看 episode.url，不想因下载变化重挂）
@@ -149,72 +118,6 @@ export default function Player() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const stageRef = useRef<HTMLDivElement>(null)
 
-  // ── 方向记忆：对齐原版 OrientationStore（true = 竖屏片源） ──
-  // 播放器要等元数据才知道画面比例；先按本地记忆定方向，同一部剧下次进来不再翻转闪动。
-  const ORIENTATION_KEY = 'zhuiying.orientation'
-  const readOrientation = (id: number): boolean | null => {
-    try {
-      const map = JSON.parse(localStorage.getItem(ORIENTATION_KEY) || '{}')
-      const v = map[`vod_${id}`]
-      return typeof v === 'boolean' ? v : null
-    } catch {
-      return null
-    }
-  }
-  const rememberOrientation = (id: number, portrait: boolean) => {
-    try {
-      const map = JSON.parse(localStorage.getItem(ORIENTATION_KEY) || '{}')
-      const key = `vod_${id}`
-      if (map[key] === portrait) return
-      map[key] = portrait
-      localStorage.setItem(ORIENTATION_KEY, JSON.stringify(map))
-    } catch {
-      /* 存储不可用时忽略：方向判断退化为每次现场算 */
-    }
-  }
-  const [videoPortrait, setVideoPortrait] = useState<boolean | null>(() => readOrientation(vodId))
-
-  // 是否以「已安装应用」运行：这决定全屏/转屏逻辑要不要插手。
-  // 安装态窗口本身就是全屏，任何额外的 requestFullscreen / orientation.lock
-  // 都会引起窗口尺寸变化，正是 PWA 独有的那部分差异。
-  const installedPwa = isInstalledPwa()
-  // 是否真正进入过全屏（只有浏览器标签页会用到）
-  const wasFullscreenRef = useRef(false)
-  // 用户主动切回竖屏时置位：避免 fullscreenchange 把「退出全屏」误判成系统返回
-  const manualUnlockRef = useRef(false)
-  // 主动离开标记：顶栏返回 / 组件卸载时我们主动退出全屏，
-  // fullscreenchange 会因此再触发一次，用这个标记避免重复 navigate。
-  const leavingRef = useRef(false)
-  // 设备当前角度：0 竖屏 / 90、270 横屏 / 180 倒竖屏
-  const [deviceAngle, setDeviceAngle] = useState(0)
-  /**
-   * 手动「旋转」。
-   *
-   * 不再调用 screen.orientation.lock()：安装成 PWA 后窗口本身就是全屏，
-   * 这句会让**整个窗口**旋转并重新布局，Android 随之重建 video 的渲染表面，
-   * 实测点一下就直接卡死（进度条也一起不响应）。
-   * 改成把播放器整体 CSS 旋转 90°：视觉上立刻变横向，窗口和渲染表面完全不动。
-   */
-  const [theater, setTheater] = useState(false)
-  useEffect(() => {
-    const read = () => {
-      const type = screen.orientation?.type ?? ''
-      if (type.startsWith('landscape')) setDeviceAngle(type.includes('secondary') ? 270 : 90)
-      else setDeviceAngle(type.includes('secondary') ? 180 : 0)
-    }
-    read()
-    screen.orientation?.addEventListener?.('change', read)
-    window.addEventListener('orientationchange', read)
-    return () => {
-      screen.orientation?.removeEventListener?.('change', read)
-      window.removeEventListener('orientationchange', read)
-    }
-  }, [])
-  // 让画面在重力坐标系里始终是横向：竖屏时转 90°，用户把手机横过来后自动补回 0°
-  const stageRotation = theater ? (90 - deviceAngle + 360) % 360 : 0
-  // 只有在「横屏片源 + 当前竖屏」时才需要这个按钮
-  const canRotate = videoPortrait === false && deviceAngle % 180 !== 90
-
   const hlsRef = useRef<Hls | null>(null)
   const tailAdHandledRef = useRef(false)
   const positionRef = useRef(0)
@@ -223,6 +126,17 @@ export default function Player() {
   const hideTimer = useRef<number | null>(null)
   const hudTimer = useRef<number | null>(null)
   const toastTimer = useRef<number | null>(null)
+  // 主动离开标记：避免「保存进度 → 返回」在重挂载时被重复触发
+  const leavingRef = useRef(false)
+  // 让广告 effect 能推进下一集，又不用把 nextEpisode 塞进依赖
+  const nextEpisodeRef = useRef<(auto?: boolean) => void>(() => undefined)
+
+  // 起播等待秒数：只在还没出首帧时累加，首帧一到就停表
+  useEffect(() => {
+    if (firstFrame) return
+    const timer = window.setInterval(() => setElapsedSec((v) => v + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [firstFrame])
 
   const source = sources[sourceIndex]
   const episode = source?.episodes[episodeIndex]
@@ -235,11 +149,6 @@ export default function Player() {
     setToast(text)
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 2000)
-  }, [])
-
-  /** 手动旋转：纯视觉旋转，不碰系统方向（避免 PWA 整窗转屏把画面卡死）。 */
-  const toggleOrientation = useCallback(() => {
-    setTheater((v) => !v)
   }, [])
 
   // ── 初始加载：最新的直链 → 下载索引 → 详情缓存，三级兜底 ──
@@ -278,8 +187,7 @@ export default function Player() {
         Math.max(Number.isFinite(pEpisode) && pEpisode >= 0 ? pEpisode : history?.episodeIndex ?? 0, 0),
         eps.length - 1,
       )
-      const sameEpisode =
-        history != null && history.sourceIndex === si && history.episodeIndex === ei
+      const sameEpisode = history != null && history.sourceIndex === si && history.episodeIndex === ei
       const finished = history != null && history.durationMs > 0 && history.positionMs >= (history.durationMs * 95) / 100
       setVod(detail)
       setSources(parsed)
@@ -287,7 +195,6 @@ export default function Player() {
       setEpisodeIndex(ei)
       setStartPositionMs(sameEpisode && !finished ? history!.positionMs : 0)
       setSpeed(getSettings().defaultSpeed)
-      markStage('详情 ✓')
       setLoading(false)
     })()
     return () => {
@@ -308,24 +215,25 @@ export default function Player() {
         })
         setWatched(map)
       })
-    const loadDownloads = () =>
-      db.downloads
-        .where('vodId')
-        .equals(vodId)
-        .toArray()
-        .then((rows) => {
-          const map: Record<number, number[]> = {}
-          rows
-            .filter((t) => t.state === 'completed')
-            .forEach((t) => {
-              map[t.sourceIndex] = [...(map[t.sourceIndex] ?? []), t.episodeIndex]
-            })
-          setDownloaded(map)
-        })
-    loadDownloads()
+    db.downloads
+      .where('vodId')
+      .equals(vodId)
+      .toArray()
+      .then((rows) => {
+        const map: Record<number, number[]> = {}
+        rows
+          .filter((t) => t.state === 'completed')
+          .forEach((t) => {
+            map[t.sourceIndex] = [...(map[t.sourceIndex] ?? []), t.episodeIndex]
+          })
+        setDownloaded(map)
+      })
   }, [vodId])
 
-  // ── 挂载 hls.js（或原生 HLS） ──
+  // ── 挂载播放源：hls.js 的标准用法 ──────────────────────────────────────
+  // <video> 原生只认 mp4 / webm；站点的播放地址是 HLS（.m3u8 分片列表），
+  // 除 Safari / iOS 外浏览器都不认，所以必须由 hls.js 把 m3u8 转成 MSE 喂给 <video>。
+  // 除此之外没有任何特殊处理：loadSource → attachMedia → 等 MANIFEST_PARSED → play()。
   useEffect(() => {
     const video = videoRef.current
     const url = episode?.url
@@ -335,179 +243,91 @@ export default function Player() {
     hlsRef.current = null
     setBuffering(false)
     setFirstFrame(false)
+    setPlaybackError(null)
     setPositionMs(0)
     setDurationMs(0)
     setSeekPreview(null)
-    setPlaybackError(null)
+    setElapsedSec(0)
     tailAdHandledRef.current = false
 
     const startAt = startPositionMs / 1000
     const onMeta = () => {
-      // 尺寸确定后判定片源方向并记忆（对齐原版 onVideoSizeChanged → OrientationStore）
-      if (video.videoWidth && video.videoHeight) {
-        const portrait = video.videoHeight >= video.videoWidth
-        setVideoPortrait(portrait)
-        rememberOrientation(vodId, portrait)
-      }
       if (startAt > 0 && Math.abs(video.currentTime - startAt) > 1) video.currentTime = startAt
       video.playbackRate = speed
       video.play().catch(() => setNeedsTap(true))
     }
     video.addEventListener('loadedmetadata', onMeta, { once: true })
 
-    // 起播看门狗（心跳式）：只有在「完全没有任何进展」时才判超时。
-    // 直接按固定 20 秒判死会误伤——Cloudflare 回源慢的时候 21 秒才出画面，
-    // 那是真的在推进，不该弹错误。所以任何一步有动静就刷新时间戳。
-    let cancelled = false
-    let lastProgress = Date.now()
-    const bumpProgress = () => {
-      lastProgress = Date.now()
-    }
-    const watchdog = window.setInterval(() => {
-      if (cancelled) return
-      if (video.readyState >= 2 || video.currentTime > 0) return
-      if (Date.now() - lastProgress > STARTUP_STALL_MS) {
-        setPlaybackError('播放超时，地址可能已失效，试试切换线路')
-      }
-    }, 1000)
+    // 两条地址作用不同，不是「双路线冗余」：
+    //   直连 —— 手机直连 CDN，最快，但可能被 CORS / 防盗链挡住
+    //   代理 —— 同源 /api/hls，一定能过跨域，但要多绕一跳
+    // 所以正常走直连，被挡住才换代理，只换一次，不猜也不反复重试。
+    // 已下载的集必须走代理，否则命中不了离线缓存。
+    const direct = toPlayableUrl(url)
+    const proxy = hlsUrl(url)
+    const offlineEpisode = downloadedRef.current[sourceIndex]?.includes(episodeIndex) ?? false
+    const candidates = offlineEpisode || !/^https:/i.test(direct) ? [proxy] : [direct, proxy]
+    let candidateIndex = 0
+    let mediaRetries = 0
 
-    if (Hls.isSupported()) {
-      const hls = new Hls({
-        maxBufferLength: 30,
-        backBufferLength: 30,
-        // 各段超时压到 8 秒：一条路线挂了要能尽快换另一条，
-        // 而不是让用户对着转圈等 15 秒才发现走不通。
-        manifestLoadingTimeOut: 8000,
-        levelLoadingTimeOut: 8000,
-        fragLoadingTimeOut: 12000,
-        manifestLoadingMaxRetry: 0,
-        levelLoadingMaxRetry: 0,
-        fragLoadingMaxRetry: 1,
+    let hls: Hls | null = null
+    const load = () => {
+      hls?.destroy()
+      mediaRetries = 0
+      hls = new Hls({
+        manifestLoadingTimeOut: 10000,
+        levelLoadingTimeOut: 10000,
+        fragLoadingTimeOut: 15000,
       })
       hlsRef.current = hls
-      // 两条取流路线：
-      //   直连 —— 手机直连 CDN，几百毫秒，但不一定通（被墙/CORS/防盗链）
-      //   代理 —— 同源 /api/hls，绕开跨域，但 Cloudflare 边缘回源国内 CDN 经常挂住
-      // 谁都不保证可用，所以做成阶梯：探测定首条，挂了就换另一条，两条都挂再重试一轮。
-      // 已下载的集必须走代理，否则命中不了离线缓存。
-      const directUrl = toPlayableUrl(url)
-      const proxyUrl = hlsUrl(url)
-      const offlineEpisode = downloadedRef.current[sourceIndex]?.includes(episodeIndex) ?? false
-      // https 页面里请求 http 源属于混合内容，会被浏览器直接拦掉
-      const canDirect = /^https:/i.test(directUrl) && !offlineEpisode
-      const routes = canDirect ? [directUrl, proxyUrl] : [proxyUrl]
-      let routeIdx = 0
-      // 每条路线各自记失败次数，换路线时优先挑「还没失败过」的那条
-      const routeFails: number[] = routes.map(() => 0)
-      let retryRounds = 0
-      let networkRetries = 0
-      let mediaRetries = 0
-
-      const loadRoute = () => {
-        const target = routes[routeIdx]
-        const isDirect = target === directUrl
-        bumpProgress()
-        markStage(isDirect ? '直连' : '代理')
-        hls.loadSource(target)
-      }
-
-      /** 找一条不是当前、且还没失败过的路线。 */
-      const nextRoute = (): number => {
-        for (let i = 0; i < routes.length; i += 1) {
-          if (i !== routeIdx && routeFails[i] === 0) return i
-        }
-        return -1
-      }
-
-      hls.attachMedia(video)
-      // 先探测路线再 loadSource：直连能通就走直连，不通直接改代理，
-      // 不再让 hls.js 自己耗一个超时周期才发现要回退。
-      void (async () => {
-        markStage(canDirect ? '探测直连…' : '走代理')
-        if (canDirect && !(await probePlaylist(directUrl, DIRECT_PROBE_TIMEOUT_MS))) {
-          routeIdx = 1
-        }
-        if (cancelled) return
-        loadRoute()
-      })()
-      // 每一步有进展就续命，避免慢但正常的加载被误判
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        bumpProgress()
-        markStage('列表 ✓')
         video.playbackRate = speed
         video.play().catch(() => setNeedsTap(true))
       })
-      hls.on(Hls.Events.LEVEL_LOADED, bumpProgress)
-      hls.on(Hls.Events.FRAG_LOADED, () => {
-        bumpProgress()
-        markStage('分片 ✓')
-      })
-      hls.on(Hls.Events.ERROR, (_e, data) => {
+      hls.on(Hls.Events.ERROR, (_event, data) => {
         if (!data.fatal) return
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          // 分片失败通常只是这一个分片的问题，原地重试更划算；
-          // 换路线等于把已拿到的播放列表整条丢掉重来，白白多等一个超时。
-          if (data.frag) {
-            if (networkRetries++ < 1) {
-              hls.startLoad()
-              return
-            }
-            setPlaybackError(describePlaybackError('network'))
-            return
-          }
-          // 播放列表/子列表拿不到 → 横向换路线，再原地重试一轮，最后交给用户
-          routeFails[routeIdx] += 1
-          const alt = nextRoute()
-          if (alt >= 0) {
-            routeIdx = alt
-            loadRoute()
-            return
-          }
-          // 两条都挂过一轮，再从头来一轮；还不行就把错误交给用户（重试 / 换线路）
-          if (retryRounds++ < 1) {
-            routeFails.fill(0)
-            routeIdx = 0
-            loadRoute()
+          // 直连被挡 → 换同源代理再试一次；代理也失败才认输
+          if (candidateIndex < candidates.length - 1) {
+            candidateIndex += 1
+            load()
             return
           }
           setPlaybackError(describePlaybackError('network'))
           return
         }
-        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries++ < 2) {
-          hls.recoverMediaError()
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
-          setPlaybackError(describePlaybackError('media'))
-        } else {
-          setPlaybackError(describePlaybackError('other'))
+        if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries < 2) {
+          mediaRetries += 1
+          hls?.recoverMediaError()
+          return
         }
+        setPlaybackError(describePlaybackError(data.type === Hls.ErrorTypes.MEDIA_ERROR ? 'media' : 'other'))
       })
+      hls.loadSource(candidates[candidateIndex])
+      hls.attachMedia(video)
+    }
+
+    if (Hls.isSupported()) {
+      load()
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      // 原生 HLS（iOS Safari）：<video> 直接吃 m3u8 不需要 CORS，
-      // 所以优先直连 CDN，避免又走一遍慢代理；http 源在 https 页面会被拦。
-      const nativeDirect = toPlayableUrl(url)
-      const useDirect = /^https:/i.test(nativeDirect)
-      markStage(useDirect ? '直连' : '代理')
-      video.src = useDirect ? nativeDirect : hlsUrl(url)
+      // iOS Safari 原生就吃 m3u8，不需要 hls.js，也不需要 CORS
+      video.src = candidates[0]
       video.play().catch(() => setNeedsTap(true))
     } else {
       setLoadError('当前浏览器不支持 HLS 播放')
     }
 
     return () => {
-      cancelled = true
-      window.clearInterval(watchdog)
       video.removeEventListener('loadedmetadata', onMeta)
-      hlsRef.current?.destroy()
-      hlsRef.current = null
+      hls?.destroy()
+      if (hlsRef.current === hls) hlsRef.current = null
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [episode?.url, playToken, sourceIndex, episodeIndex])
 
   // ── 播放器事件 ──
-  // 关键：初次渲染是「正在获取播放地址」全屏加载页，<video> 还没挂载，
-  // 若在 [] 阶段绑定会拿到 null 且永不重绑，play/pause/waiting 全部丢失。
-  // 用 vod 驱动：详情解析成功、video 进入 DOM 后再绑定一次。
+  // 首次渲染是「正在获取播放地址」全屏加载页，<video> 还没挂载；
+  // 用 vod 驱动绑定，确保详情解析成功、video 进入 DOM 后才真正挂上监听。
   useEffect(() => {
     const video = videoRef.current
     if (!video || !vod) return
@@ -531,15 +351,11 @@ export default function Player() {
     const onPlaying = () => {
       setBuffering(false)
       setFirstFrame(true)
-      markStage('首帧 ✓')
     }
     // 兜底：媒体已经有首帧数据（loadeddata 已触发）就说明画面可以出来了，
     // 哪怕 playing 事件因为自动播放被拦等原因没派发，也不能让加载层赖着不走。
     const onFirstData = () => {
-      if (video.readyState >= 2) {
-        setFirstFrame(true)
-        markStage('首帧 ✓')
-      }
+      if (video.readyState >= 2) setFirstFrame(true)
     }
     const onError = () => {
       // hls.js 的致命错误由它自己的 ERROR 事件处理；这里兜底原生 HLS / 直接 mp4。
@@ -597,12 +413,12 @@ export default function Player() {
     }).catch(() => undefined)
   }, [])
 
-  // 统一的「返回上一页」：保存进度后返回。横屏片源在系统返回键退出全屏时复用它。
+  // 统一的「返回上一页」：保存进度后返回
   const leavePlayer = useCallback(() => {
     if (leavingRef.current) return
     leavingRef.current = true
-    wasFullscreenRef.current = false
     persistProgress()
+    if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined)
     navigate(-1)
   }, [persistProgress, navigate])
 
@@ -627,7 +443,6 @@ export default function Player() {
   // ── 广告区间 ──
   useEffect(() => {
     setAdRanges([])
-    setAdSkipping(false)
     const url = episode?.url
     if (!url || !settings.skipAds) return
     let alive = true
@@ -653,9 +468,10 @@ export default function Player() {
   // 播到广告区间就跳过去（不重写播放列表，总时长不变）
   useEffect(() => {
     if (adRanges.length === 0) return
-    const timer = window.setInterval(() => {
-      const video = videoRef.current
-      if (!video || video.paused || video.seeking) return
+    const video = videoRef.current
+    if (!video) return
+    const onTime = () => {
+      if (video.paused || video.seeking) return
       const pos = video.currentTime * 1000
       // 原生 AD_SKIP_LEAD_MS = 300：提前一点触发，避免慢设备上闪出广告首帧
       const range =
@@ -673,25 +489,15 @@ export default function Player() {
         !tailAdHandledRef.current
       ) {
         tailAdHandledRef.current = true
-        nextEpisode(true)
+        nextEpisodeRef.current(true)
         return
       }
 
-      // 先暂停再 seek，等 seeked 后恢复播放：避免慢设备上闪一帧广告
-      setAdSkipping(true)
-      video.pause()
-      const skippedSeconds = Math.max(1, Math.round((range.endMs - pos) / 1000))
-      const onSeeked = () => {
-        video.removeEventListener('seeked', onSeeked)
-        video.play().catch(() => undefined)
-        setAdSkipping(false)
-        showToast(`已跳过 ${skippedSeconds} 秒广告`)
-      }
-      video.addEventListener('seeked', onSeeked)
+      showToast(`已跳过 ${Math.max(1, Math.round((range.endMs - pos) / 1000))} 秒广告`)
       video.currentTime = Math.min((range.endMs + 250) / 1000, video.duration || Infinity)
-    }, 100)
-    return () => window.clearInterval(timer)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }
+    video.addEventListener('timeupdate', onTime)
+    return () => video.removeEventListener('timeupdate', onTime)
   }, [adRanges, settings.autoPlayNext, showToast])
 
   // ── 控制层自动隐藏 ──
@@ -759,71 +565,28 @@ export default function Player() {
     bumpControls()
   }
 
+  /**
+   * 全屏：标准 Fullscreen API。
+   * 不调用 screen.orientation.lock()——在安装态 PWA 里那是整窗旋转 + 重新布局，
+   * Android 会因此重建 video 的渲染表面，画面直接卡住。横竖由用户自己转手机，
+   * object-contain 会自动适配，这条路径不会出问题。
+   */
   const toggleFullscreen = () => {
-    const el = stageRef.current
-    if (!el) return
+    const stage = stageRef.current
+    if (!stage) return
     if (document.fullscreenElement) {
       document.exitFullscreen().catch(() => undefined)
-    } else {
-      el.requestFullscreen
-        ?.()
-        .then(() => {
-          // 横屏片源锁 landscape，竖屏片源（短剧）锁 portrait
-          if (videoPortrait === false) return screen.orientation?.lock?.('landscape')
-          if (videoPortrait === true) return screen.orientation?.lock?.('portrait')
-        })
-        .catch(() => undefined)
+      return
     }
+    stage.requestFullscreen?.().catch(() => undefined)
   }
 
   // StrictMode 开发模式会 mount→unmount→remount；每次挂载都重置主动离开标记，
-  // 否则第一次 unmount 置的 true 会残留到 remount，导致返回按钮/自动返回全部失效。
+  // 否则第一次 unmount 置的 true 会残留到 remount，导致返回按钮失效。
   useEffect(() => {
     leavingRef.current = false
-    wasFullscreenRef.current = false
-  }, [])
-
-  // 离开全屏时解除方向锁；卸载时兜底还原（对齐原版 exitPlayer 回竖屏）
-  useEffect(() => {
-    const unlock = () => {
-      try {
-        screen.orientation?.unlock?.()
-      } catch {
-        /* 未锁定时 unlock 会抛错，忽略 */
-      }
-    }
-    const onFsChange = () => {
-      // 安装态窗口本身就在全屏里，它的 fullscreenchange 不代表用户按了返回，
-      // 不能据此退出播放页（否则转屏一次就把人踢回详情页）。
-      if (installedPwa || manualUnlockRef.current) return
-      if (document.fullscreenElement) {
-        // 进入全屏（横屏片源自动转的），记下来；系统返回键退出时据此判断
-        wasFullscreenRef.current = true
-        return
-      }
-      unlock()
-      // 横屏片源在系统返回键 / 手势下会被浏览器先退出全屏（Web 收不到返回事件），
-      // 表现为「点一次返回变竖屏继续播」。这里检测到从全屏退出就直接回上一页。
-      // 用 wasFullscreen 而不是 videoPortrait：拿不到视频宽高时也能正确识别。
-      // leavingRef 排除我们主动退出的情况（顶栏返回、组件卸载）。
-      if (!leavingRef.current && wasFullscreenRef.current && vod && !loading) {
-        leavePlayer()
-      }
-    }
-    document.addEventListener('fullscreenchange', onFsChange)
-    return () => document.removeEventListener('fullscreenchange', onFsChange)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [leavePlayer, videoPortrait, vod, loading, installedPwa])
-
-  // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
-  useEffect(() => {
     return () => {
       leavingRef.current = true
-      try {
-        screen.orientation?.unlock?.()
-      } catch {
-        /* 未锁定时 unlock 会抛错，忽略 */
-      }
       if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined)
     }
   }, [])
@@ -862,6 +625,7 @@ export default function Player() {
     }
     jumpTo(sourceIndex, episodeIndex + 1)
   }
+  nextEpisodeRef.current = nextEpisode
 
   /** 播放中失败后的两个出口：重试当前集 / 切到下一条可用线路。 */
   const retryPlayback = () => {
@@ -978,7 +742,7 @@ export default function Player() {
     }
   }
 
-  const onPointerUp = (_e: React.PointerEvent<HTMLDivElement>) => {
+  const onPointerUp = () => {
     const g = gesture.current
     const video = videoRef.current
     if (!video) return
@@ -1024,12 +788,10 @@ export default function Player() {
       return
     }
     g.lastTap = now
-    {
-      g.singleTapTimer = window.setTimeout(() => {
-        setControlsVisible((v) => !v)
-        bumpControls()
-      }, 260)
-    }
+    g.singleTapTimer = window.setTimeout(() => {
+      setControlsVisible((v) => !v)
+      bumpControls()
+    }, 260)
   }
 
   // 点击底部控制条时不要把控制层收掉
@@ -1054,11 +816,6 @@ export default function Player() {
         <p className="mt-4 text-body-md text-white/70">
           正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
         </p>
-        {elapsedSec > 3 && stages.length > 0 && (
-          <p className="mt-1.5 max-w-[86%] text-center text-[11px] leading-[16px] text-white/35">
-            {stages.join(' · ')}
-          </p>
-        )}
         {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
         {elapsedSec >= 8 && (
           <div className="mt-6 flex gap-3">
@@ -1107,21 +864,7 @@ export default function Player() {
     <div
       ref={stageRef}
       className="fixed inset-0 z-50 select-none bg-black"
-      style={{
-        cursor: controlsVisible ? 'default' : 'none',
-        // 手动横屏：整体旋转，长宽互换，绕中心转，视觉上正好铺满
-        ...(stageRotation
-          ? {
-              left: '50%',
-              top: '50%',
-              right: 'auto',
-              bottom: 'auto',
-              width: stageRotation % 180 === 0 ? '100vw' : '100vh',
-              height: stageRotation % 180 === 0 ? '100vh' : '100vw',
-              transform: `translate(-50%, -50%) rotate(${stageRotation}deg)`,
-            }
-          : null),
-      }}
+      style={{ cursor: controlsVisible ? 'default' : 'none' }}
     >
       <video
         ref={videoRef}
@@ -1132,15 +875,6 @@ export default function Player() {
           const v = e.currentTarget
           const d = Number.isFinite(v.duration) ? v.duration * 1000 : 0
           setDurationMs(d)
-          // 与播放 effect 里的 onMeta 重复执行是安全的：判定是幂等的
-          if (v.videoWidth && v.videoHeight) {
-            const portrait = v.videoHeight >= v.videoWidth
-            setVideoPortrait(portrait)
-            rememberOrientation(vodId, portrait)
-          }
-          if (startPositionMs > 0 && Math.abs(v.currentTime - startPositionMs / 1000) > 1) {
-            v.currentTime = startPositionMs / 1000
-          }
         }}
         onDoubleClick={(e) => e.preventDefault()}
         onClick={(e) => e.stopPropagation()}
@@ -1205,12 +939,6 @@ export default function Player() {
           <p className="mt-4 text-body-md text-white/70">
             正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
           </p>
-          {elapsedSec > 3 && stages.length > 0 && (
-            <p className="mt-1.5 max-w-[86%] text-center text-[11px] leading-[16px] text-white/35">
-              {stages.join(' · ')}
-            </p>
-          )}
-          {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
           {elapsedSec >= 8 && (
             <div className="pointer-events-auto mt-6 flex gap-3">
               <button
@@ -1249,12 +977,6 @@ export default function Player() {
       {showBufferSpinner && firstFrame && !loadError && !playbackError && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-white/80 border-t-transparent" />
-        </div>
-      )}
-
-      {adSkipping && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/45">
-          <span className="rounded-lg bg-black/70 px-3 py-1.5 text-label-lg text-white">正在跳过广告…</span>
         </div>
       )}
 
@@ -1314,10 +1036,7 @@ export default function Player() {
                 onNext={() => nextEpisode()}
                 onSpeed={() => setSpeedMenuOpen((v) => !v)}
                 onPlaylist={() => setPanelOpen(true)}
-                onRotate={toggleOrientation}
-                landscape={theater}
-                canRotate={canRotate}
-                rotation={stageRotation}
+                onFullscreen={toggleFullscreen}
               />
             </div>
           )}
@@ -1330,7 +1049,6 @@ export default function Player() {
                 durationMs={durationMs}
                 bufferedMs={bufferedMs}
                 onSeek={() => undefined}
-                rotation={stageRotation}
               />
               <div className="-mt-1 flex items-center justify-between text-label-md text-white/85">
                 <span>{playbackText(seekPreview)}</span>
@@ -1430,10 +1148,7 @@ function PlayerBottomBar({
   onNext,
   onSpeed,
   onPlaylist,
-  onRotate,
-  landscape,
-  canRotate,
-  rotation,
+  onFullscreen,
 }: {
   positionMs: number
   durationMs: number
@@ -1446,10 +1161,7 @@ function PlayerBottomBar({
   onNext: () => void
   onSpeed: () => void
   onPlaylist: () => void
-  onRotate: () => void
-  landscape: boolean
-  canRotate: boolean
-  rotation: number
+  onFullscreen: () => void
 }) {
   return (
     <div className="bg-gradient-to-t from-black/80 to-transparent px-3.5 pt-5 pb-2.5 text-white">
@@ -1458,7 +1170,6 @@ function PlayerBottomBar({
         durationMs={durationMs}
         bufferedMs={bufferedMs}
         onSeek={onSeek}
-        rotation={rotation}
       />
       <div className="flex items-center">
         <span className="text-label-md">{playbackText(positionMs)}</span>
@@ -1478,39 +1189,28 @@ function PlayerBottomBar({
         </button>
         <div className="w-2" />
         <ControlIcon name="playlist" label="选集" onClick={onPlaylist} />
-        {canRotate && (
-          <button
-            onClick={onRotate}
-            className="tap ml-1 rounded-md bg-white/15 px-2 py-1 text-label-md"
-            aria-label={landscape ? '切回竖屏' : '横屏播放'}
-          >
-            {landscape ? '竖屏' : '旋转'}
-          </button>
-        )}
+        <ControlIcon name="fullscreen" label="全屏" onClick={onFullscreen} size={34} />
       </div>
     </div>
   )
 }
 
-/** 进度条：视觉 3px、触摸区 22px；已缓冲段与已播放段分开画。 */
 /**
  * 进度条：视觉 3px、触摸区 22px。
  *
  * `touch-none` 不能省：手机上按住拖动时，浏览器默认会把这串触摸当成页面滚动手势，
- * 触发 pointercancel 后我们的拖动状态被清掉，表现就是「进度条拖不动」。
+ * 触发 pointercancel 后拖动状态被清掉，表现就是「进度条拖不动」。
  */
 function PlayerProgress({
   positionMs,
   durationMs,
   bufferedMs,
   onSeek,
-  rotation,
 }: {
   positionMs: number
   durationMs: number
   bufferedMs: number
   onSeek: (ms: number) => void
-  rotation: number
 }) {
   const ref = useRef<HTMLDivElement>(null)
   const [dragging, setDragging] = useState(false)
@@ -1518,23 +1218,13 @@ function PlayerProgress({
   const ratio = durationMs > 0 ? Math.min(1, Math.max(0, (dragging ? preview : positionMs) / durationMs)) : 0
   const bufferedRatio = durationMs > 0 ? Math.min(1, bufferedMs / durationMs) : 0
 
-  /**
-   * 把指针位置换算成进度值。
-   *
-   * 手动横屏是把整个播放器 CSS 旋转的，进度条在屏幕坐标系里就变成了竖向，
-   * 此时仍用 clientX 会算出完全错误的值，所以要按当前旋转角度挑轴、必要时反向。
-   */
-  const valueAt = (clientX: number, clientY: number) => {
+  /** 指针横坐标换算成进度。播放器不再整体旋转，所以只认 clientX 一条轴。 */
+  const valueAt = (clientX: number) => {
     const el = ref.current
     if (!el || durationMs <= 0) return 0
     const rect = el.getBoundingClientRect()
-    const angle = ((rotation % 360) + 360) % 360
-    let ratio: number
-    if (angle === 90) ratio = (clientY - rect.top) / rect.height
-    else if (angle === 270) ratio = (rect.bottom - clientY) / rect.height
-    else if (angle === 180) ratio = (rect.right - clientX) / rect.width
-    else ratio = (clientX - rect.left) / rect.width
-    return Math.min(durationMs, Math.max(0, ratio * durationMs))
+    const ratioInBar = (clientX - rect.left) / rect.width
+    return Math.min(durationMs, Math.max(0, ratioInBar * durationMs))
   }
 
   return (
@@ -1545,15 +1235,15 @@ function PlayerProgress({
         if (durationMs <= 0) return
         ;(e.currentTarget as HTMLElement).setPointerCapture(e.pointerId)
         setDragging(true)
-        setPreview(valueAt(e.clientX, e.clientY))
+        setPreview(valueAt(e.clientX))
       }}
       onPointerMove={(e) => {
         if (!dragging) return
-        setPreview(valueAt(e.clientX, e.clientY))
+        setPreview(valueAt(e.clientX))
       }}
       onPointerUp={(e) => {
         if (!dragging) return
-        const target = valueAt(e.clientX, e.clientY)
+        const target = valueAt(e.clientX)
         setDragging(false)
         onSeek(target)
       }}
