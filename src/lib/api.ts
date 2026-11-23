@@ -49,6 +49,17 @@ export function toPlayableUrl(raw: string): string {
  * 接口响应的 Content-Type 是 text/html（内容是 JSON），所以不能按 json() 读；
  * 这里先读文本，失败按「接口结构变化」报错，而不是抛一个用户看不懂的解析异常。
  */
+/** 请求超时兜底：上游卡住时不能无限转圈，到点就报错让用户重试/换源。 */
+const REQUEST_TIMEOUT_MS = 20000
+
+function timeoutSignal(ms: number): AbortSignal | undefined {
+  try {
+    return AbortSignal.timeout(ms)
+  } catch {
+    return undefined
+  }
+}
+
 export async function requestRaw(
   params: Record<string, string | number | undefined>,
   base?: string,
@@ -60,7 +71,7 @@ export async function requestRaw(
   const url = `/api/maccms?__base=${baseParam(base)}&${search.toString()}`
   let body: string
   try {
-    const res = await fetch(url)
+    const res = await fetch(url, { signal: timeoutSignal(REQUEST_TIMEOUT_MS) })
     if (!res.ok) {
       const detail = await res.text().catch(() => '')
       throw new ApiException(friendlyProxyError(detail) || `接口返回 HTTP ${res.status}`)
@@ -68,6 +79,9 @@ export async function requestRaw(
     body = await res.text()
   } catch (e) {
     if (e instanceof ApiException) throw e
+    if ((e as Error)?.name === 'TimeoutError' || (e as Error)?.name === 'AbortError') {
+      throw new ApiException('接口响应超时，请重试或更换接口地址', e)
+    }
     throw new ApiException('网络连接失败，请检查网络或稍后重试', e)
   }
   if (!body.trim()) throw new ApiException('接口返回为空')

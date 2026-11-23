@@ -12,7 +12,20 @@ self.addEventListener('install', () => {
 })
 
 self.addEventListener('activate', (event) => {
-  event.waitUntil(self.clients.claim())
+  event.waitUntil(
+    (async () => {
+      await self.clients.claim()
+      // 清掉旧版「缓存优先」时代留下的播放列表：分片地址带签名、早已过期，
+      // 留着只会让 hls.js 去拉失效地址。已下载的分片（/api/seg）不动。
+      const cache = await caches.open(MEDIA_CACHE)
+      const keys = await cache.keys()
+      await Promise.all(
+        keys
+          .filter((req) => new URL(req.url).pathname === '/api/hls')
+          .map((req) => cache.delete(req)),
+      )
+    })(),
+  )
 })
 
 self.addEventListener('fetch', (event) => {

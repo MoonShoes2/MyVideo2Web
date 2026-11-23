@@ -302,7 +302,18 @@ export default function Player() {
     video.addEventListener('loadedmetadata', onMeta, { once: true })
 
     if (Hls.isSupported()) {
-      const hls = new Hls({ maxBufferLength: 30, backBufferLength: 30 })
+      const hls = new Hls({
+        maxBufferLength: 30,
+        backBufferLength: 30,
+        // 加载超时/重试上限：分片或播放列表卡住时到点报 fatal，
+        // 交给下面的错误浮层（重试 / 换线路），而不是一直转圈。
+        manifestLoadingTimeOut: 15000,
+        levelLoadingTimeOut: 15000,
+        fragLoadingTimeOut: 25000,
+        manifestLoadingMaxRetry: 2,
+        levelLoadingMaxRetry: 2,
+        fragLoadingMaxRetry: 3,
+      })
       hlsRef.current = hls
       hls.loadSource(hlsUrl(url))
       hls.attachMedia(video)
