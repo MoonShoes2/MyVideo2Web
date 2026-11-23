@@ -21,6 +21,42 @@ const MAX_AD_RATIO = 0.5
 const MIN_SPLICE_MS = 1000
 const MAX_SPLICE_MS = 30_000
 
+/**
+ * 广告素材指纹（对应原生 AdFingerprintStore）：同一个广告在不同集里
+ * URL 只有签名参数不同，去掉 query 后的 path 是稳定的。记住它，下一集
+ * 即使用户清了标记也能直接跳过。
+ */
+const FP_KEY = 'zy.adFingerprints'
+const FP_MAX = 32
+
+function uriFingerprint(uri: string): string {
+  const noQuery = uri.split('?')[0]
+  try {
+    return new URL(noQuery, window.location.href).pathname
+  } catch {
+    return noQuery
+  }
+}
+
+function loadFingerprints(): Set<string> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(FP_KEY) || '[]')
+    return new Set(Array.isArray(parsed) ? parsed.filter((x): x is string => typeof x === 'string') : [])
+  } catch {
+    return new Set()
+  }
+}
+
+function rememberFingerprints(prints: string[]) {
+  if (prints.length === 0) return
+  const next = [...prints, ...loadFingerprints()].slice(0, FP_MAX)
+  try {
+    localStorage.setItem(FP_KEY, JSON.stringify(next))
+  } catch {
+    /* 隐私模式下写不了就放弃，不影响本次播放 */
+  }
+}
+
 function isAdUri(uri: string): boolean {
   const lower = uri.toLowerCase()
   return MARKS.some((m) => lower.includes(m))
@@ -117,6 +153,36 @@ function spliceRanges(segments: AdSegment[]): AdRange[] {
   return out
 }
 
+/** 命中已知广告指纹的连续分片（至少 2 片，避免单个同名片段误伤正片）。 */
+function fingerprintRanges(segments: AdSegment[], known: Set<string>): AdRange[] {
+  if (known.size === 0) return []
+  const ranges: AdRange[] = []
+  let start = -1
+  let count = 0
+  segments.forEach((segment, index) => {
+    const hit = known.has(uriFingerprint(segment.uri))
+    if (hit && start < 0) start = segment.startMs
+    if (hit) count++
+    if ((!hit || index === segments.length - 1) && start >= 0) {
+      if (count >= 3) ranges.push({ startMs: start, endMs: segment.endMs })
+      start = -1
+      count = 0
+    }
+  })
+  return ranges
+}
+
+/** 已在本次播放里确认的广告分片，写进指纹库供后续集复用。 */
+export function collectAdFingerprints(segments: AdSegment[], ranges: AdRange[]): string[] {
+  const prints = new Set<string>()
+  segments.forEach((segment) => {
+    if (ranges.some((r) => segment.startMs >= r.startMs && segment.startMs < r.endMs)) {
+      prints.add(uriFingerprint(segment.uri))
+    }
+  })
+  return Array.from(prints)
+}
+
 function mergeOverlapping(ranges: AdRange[]): AdRange[] {
   if (ranges.length <= 1) return ranges
   const sorted = [...ranges].sort((a, b) => a.startMs - b.startMs)
@@ -132,11 +198,15 @@ function mergeOverlapping(ranges: AdRange[]): AdRange[] {
   return out
 }
 
-/** 标记法 + 拼接法；占比超过一半则认为规则失配，整集不跳。 */
-export function parseAdRanges(playlist: string): AdRange[] {
+/** 标记法 + 拼接法 + 指纹法；占比超过一半则认为规则失配，整集不跳。 */
+export function parseAdRanges(playlist: string, known: Set<string> = new Set()): AdRange[] {
   const segments = parseSegments(playlist)
   if (segments.length === 0) return []
-  const ranges = mergeOverlapping([...markerRanges(segments), ...spliceRanges(segments)])
+  const ranges = mergeOverlapping([
+    ...markerRanges(segments),
+    ...spliceRanges(segments),
+    ...fingerprintRanges(segments, known),
+  ])
   if (ranges.length === 0) return []
   const total = segments[segments.length - 1].endMs
   if (total <= 0) return []
@@ -151,17 +221,26 @@ function isMaster(playlist: string): boolean {
 /** 取当前集的广告区间；master 播放列表先下钻到第一条子线路。失败返回 null（交给上层重试）。 */
 export async function resolveAdRanges(url: string): Promise<AdRange[] | null> {
   try {
+    const known = loadFingerprints()
     const text = await fetchPlaylistText(url)
-    if (!isMaster(text)) return parseAdRanges(text)
-    const lines = text.split(/\r?\n/).map((l) => l.trim())
-    const at = lines.findIndex((l) => l.startsWith('#EXT-X-STREAM-INF'))
-    const child = lines.slice(at + 1).find((l) => l && !l.startsWith('#'))
-    if (!child) return []
-    // 代理已经把 URI 改写成了 /api/hls?u=...：直接请求它，别再套一层 hlsUrl
-    const childText = child.startsWith('/api/')
-      ? await (await fetch(child)).text()
-      : await fetchPlaylistText(child)
-    return parseAdRanges(childText)
+    const playlist = !isMaster(text)
+      ? text
+      : await (async () => {
+          const lines = text.split(/\r?\n/).map((l) => l.trim())
+          const at = lines.findIndex((l) => l.startsWith('#EXT-X-STREAM-INF'))
+          const child = lines.slice(at + 1).find((l) => l && !l.startsWith('#'))
+          if (!child) return ''
+          // 代理已经把 URI 改写成了 /api/hls?u=...：直接请求它，别再套一层 hlsUrl
+          return child.startsWith('/api/')
+            ? (await fetch(child)).text()
+            : fetchPlaylistText(child)
+        })()
+    if (!playlist) return []
+    const ranges = parseAdRanges(playlist, known)
+    if (ranges.length > 0) {
+      rememberFingerprints(collectAdFingerprints(parseSegments(playlist), ranges))
+    }
+    return ranges
   } catch (e) {
     console.warn('[ad] 广告区间解析失败:', (e as Error).message)
     return null

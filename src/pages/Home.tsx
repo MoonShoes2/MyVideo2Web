@@ -22,7 +22,18 @@ import {
 export default function Home() {
   const navigate = useNavigate()
   const pager = useVodPager((page, force) => fetchPage(page, null, null, 12, force))
-  const history = useLiveQuery(() => db.history.orderBy('updatedAt').reverse().limit(10).toArray(), []) ?? []
+  // 对齐原生 HomeViewModel：只留未看完且有进度的，最多 3 条
+  const history =
+    useLiveQuery(
+      () =>
+        db.history
+          .orderBy('updatedAt')
+          .reverse()
+          .filter((r) => r.positionMs > 0 && !(r.durationMs > 0 && r.positionMs >= r.durationMs * 0.95))
+          .limit(3)
+          .toArray(),
+      [],
+    ) ?? []
   const scrollRef = useRef<HTMLDivElement>(null)
   const [pull, setPull] = useState(0)
   const [refreshing, setRefreshing] = useState(false)
@@ -68,13 +79,6 @@ export default function Home() {
         >
           <Icon name="search" size={17} />
           <span className="ml-1.5 truncate text-body-sm">搜影片名</span>
-        </button>
-        <button
-          onClick={refresh}
-          aria-label="刷新"
-          className="tap ml-1 flex h-9 w-9 items-center justify-center text-muted"
-        >
-          <Icon name="refresh" size={19} className={refreshing ? 'animate-spin' : ''} />
         </button>
       </TabHeader>
 

@@ -20,6 +20,20 @@
   --poster-placeholder: #edeef2;
   --hero-top: #ff8a3d;
   --hero-bottom: #ff4d1f;
+  /* Tailwind 透明度变体（bg-brand/15 等）需要 RGB 通道变量；hex 变量保留给 CSS 直接使用 */
+  --bg-rgb: 245 246 248;
+  --surface-rgb: 255 255 255;
+  --surface-variant-rgb: 237 238 242;
+  --surface-high-rgb: 228 230 235;
+  --text-rgb: 20 21 26;
+  --text-secondary-rgb: 107 110 123;
+  --divider-rgb: 229 230 235;
+  --brand-rgb: 255 77 31;
+  --brand-deep-rgb: 255 77 31;
+  --gold-rgb: 255 176 32;
+  --danger-rgb: 245 72 77;
+  --success-rgb: 63 191 127;
+  --poster-placeholder-rgb: 237 238 242;
 }
 
 .dark {
@@ -39,6 +53,19 @@
   --poster-placeholder: #1f2129;
   --hero-top: #ff8a3d;
   --hero-bottom: #ff4d1f;
+  --bg-rgb: 14 15 19;
+  --surface-rgb: 21 23 29;
+  --surface-variant-rgb: 31 33 41;
+  --surface-high-rgb: 39 42 52;
+  --text-rgb: 245 246 248;
+  --text-secondary-rgb: 154 156 168;
+  --divider-rgb: 38 41 51;
+  --brand-rgb: 255 106 43;
+  --brand-deep-rgb: 255 77 31;
+  --gold-rgb: 255 176 32;
+  --danger-rgb: 245 72 77;
+  --success-rgb: 63 191 127;
+  --poster-placeholder-rgb: 31 33 41;
 }
 
 @layer base {

@@ -1,44 +1,44 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { useLiveQuery } from 'dexie-react-hooks'
-import { db } from '../lib/db'
 import { clearPageCache } from '../lib/repo'
 import { clearCompleted, listDownloads } from '../lib/downloads'
 import { sizeText } from '../lib/parse'
+import { CACHE_CAPACITY_OPTIONS, updateSettings, useSettings } from '../lib/settings'
+import { Icon } from '../components/icons'
 import { ScreenTopBar } from '../components/common'
 import { Dialog } from './Settings'
 import { PageShell, useGoBack } from '../App'
 
 export default function CachePage() {
   const goBack = useGoBack()
-  const navigate = useNavigate()
-  const pageCacheCount = useLiveQuery(() => db.pageCache.count(), [], 0)
-  const favoriteCount = useLiveQuery(() => db.favorites.count(), [], 0)
-  const historyCount = useLiveQuery(() => db.history.count(), [], 0)
+  const settings = useSettings()
   const [completed, setCompleted] = useState({ count: 0, bytes: 0 })
-  const [usage, setUsage] = useState<{ quota: number; usage: number } | null>(null)
-  const [confirm, setConfirm] = useState<null | 'pages' | 'downloads' | 'all'>(null)
+  const [usage, setUsage] = useState(0)
+  const [notice, setNotice] = useState<string | null>(null)
+  const [pendingClear, setPendingClear] = useState<boolean | null>(null)
 
-  const refresh = () => {
+  useEffect(() => {
     listDownloads()
       .then((rows) => {
         const done = rows.filter((t) => t.state === 'completed')
         setCompleted({ count: done.length, bytes: done.reduce((s, t) => s + t.bytes, 0) })
       })
       .catch(() => undefined)
-    navigator.storage
-      ?.estimate?.()
-      .then(({ quota = 0, usage: used = 0 }) => setUsage({ quota, usage: used }))
-      .catch(() => undefined)
-  }
+    navigator.storage?.estimate?.().then(({ usage: used = 0 }) => setUsage(used)).catch(() => undefined)
+  }, [])
 
-  useEffect(refresh, [])
-
-  const doClear = async () => {
-    if (confirm === 'pages' || confirm === 'all') await clearPageCache()
-    if (confirm === 'downloads' || confirm === 'all') await clearCompleted()
-    setConfirm(null)
-    refresh()
+  const clear = async (isPlayback: boolean) => {
+    setPendingClear(null)
+    if (isPlayback) {
+      // 浏览器不允许单独清 HTTP 缓存；这里先清页面缓存，并明确告知用户边界。
+      await clearPageCache()
+      setNotice('浏览器无法单独清除播放分片，已清空页面缓存；完整清理请在浏览器设置中清除站点数据。')
+    } else {
+      await clearCompleted()
+      setNotice(null)
+      const rows = await listDownloads()
+      const done = rows.filter((t) => t.state === 'completed')
+      setCompleted({ count: done.length, bytes: done.reduce((s, t) => s + t.bytes, 0) })
+    }
   }
 
   return (
@@ -46,94 +46,80 @@ export default function CachePage() {
       <div className="flex h-full flex-col overflow-y-auto bg-bg no-scrollbar">
         <ScreenTopBar title="缓存管理" onBack={goBack} />
 
-        <section>
-          <p className="px-[30px] pb-1.5 pt-3.5 text-label-md text-muted">存储占用</p>
-          <div className="mx-4 rounded-card bg-surface px-4 py-3">
-            <p className="text-title-md text-ink">
-              {usage ? `${sizeText(usage.usage)} / ${sizeText(usage.quota)}` : '统计中…'}
-            </p>
-            <p className="mt-1 text-label-sm text-muted">
-              浏览器为该站点分配的总空间。视频分片、页面缓存与片库数据都算在这里。
-            </p>
-            {usage && usage.quota > 0 && (
-              <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-divider">
-                <div
-                  className="h-full bg-brand"
-                  style={{ width: `${Math.min(100, (usage.usage / usage.quota) * 100)}%` }}
-                />
-              </div>
-            )}
+        <SettingsGroup title="播放缓存">
+          <CacheRow
+            title="已用空间"
+            subtitle="边看边缓存，回看无需重新加载"
+            value={sizeText(usage)}
+          />
+          <div className="px-4 py-2.5">
+            <p className="text-title-sm text-ink">缓存容量</p>
+            <div className="mt-2 grid grid-cols-4 gap-2">
+              {CACHE_CAPACITY_OPTIONS.map((gb) => {
+                const active = settings.cacheCapacityGb === gb
+                return (
+                  <button
+                    key={gb}
+                    onClick={() => {
+                      updateSettings({ cacheCapacityGb: gb })
+                      setNotice(`浏览器按自身配额自动淘汰缓存，${gb}GB 为目标档位。`)
+                    }}
+                    className={`tap rounded-lg py-2 text-label-md ${
+                      active ? 'bg-brand text-white' : 'bg-surface-high text-ink'
+                    }`}
+                  >
+                    {gb}GB
+                  </button>
+                )
+              })}
+            </div>
           </div>
-        </section>
+          {notice && <p className="px-4 py-1 text-label-sm text-brand">{notice}</p>}
+          <CacheRow
+            title="清理播放缓存"
+            subtitle="只清除播放分片，不影响已下载内容"
+            action="清理"
+            danger
+            onAction={() => setPendingClear(true)}
+            last
+          />
+        </SettingsGroup>
 
-        <section>
-          <p className="px-[30px] pb-1.5 pt-3.5 text-label-md text-muted">明细</p>
-          <div className="mx-4 overflow-hidden rounded-card bg-surface">
-            <CacheRow
-              title="页面缓存"
-              subtitle="分类列表、搜索结果的原始响应（最长留 3 天）"
-              value={`${pageCacheCount} 项`}
-              action="清空"
-              onAction={() => setConfirm('pages')}
-            />
-            <CacheRow
-              title="离线下载"
-              subtitle={`已缓存 ${completed.count} 集`}
-              value={sizeText(completed.bytes)}
-              action={completed.count > 0 ? '清理' : undefined}
-              onAction={() => setConfirm('downloads')}
-              onOpen={() => navigate('/downloads')}
-            />
-            <CacheRow
-              title="播放缓存"
-              subtitle="播放过的分片由浏览器自动缓存，无法逐条统计"
-              value="—"
-            />
-            <CacheRow
-              title="收藏与观看记录"
-              subtitle="本地片库数据，清理后不可恢复"
-              value={`收藏 ${favoriteCount} · 历史 ${historyCount}`}
-              action="查看"
-              onAction={() => navigate('/history')}
-              last
-            />
-          </div>
-        </section>
-
-        <div className="mx-4 mt-5">
-          <button
-            onClick={() => setConfirm('all')}
-            className="tap w-full rounded-card bg-surface py-3 text-center text-title-sm text-danger"
-          >
-            清理全部缓存
-          </button>
-          <p className="mt-3 px-1 text-label-sm text-muted">
-            清理只影响本机缓存，不会删除收藏与观看记录；离线下载清理后需重新下载才能离线观看。
+        <SettingsGroup title="下载缓存">
+          <CacheRow
+            title="已用空间"
+            subtitle="已下载内容不会自动清理"
+            value={sizeText(completed.bytes)}
+          />
+          <CacheRow
+            title="清理下载缓存"
+            subtitle="删除后需要重新下载"
+            action="清理"
+            danger
+            onAction={() => setPendingClear(false)}
+            last
+          />
+          <p className="px-4 py-3 text-label-sm text-muted">
+            已下载的影片请前往「离线下载」页面管理。
           </p>
-        </div>
+        </SettingsGroup>
+
         <div className="h-7" />
       </div>
 
-      {confirm && (
-        <Dialog
-          title={
-            confirm === 'pages' ? '清空页面缓存？' : confirm === 'downloads' ? '清理离线下载？' : '清理全部缓存？'
-          }
-          onClose={() => setConfirm(null)}
-        >
-          <p className="text-body-sm text-muted">
-            {confirm === 'all'
-              ? '将清空页面缓存与全部已下载的分片。收藏和观看记录不受影响。'
-              : confirm === 'pages'
-                ? '清空后列表需要重新联网加载一次。'
-                : `将删除已缓存的 ${completed.count} 集分片（约 ${sizeText(completed.bytes)}）。`}
+      {pendingClear != null && (
+        <Dialog title={pendingClear ? '清理播放缓存' : '清理下载缓存'} onClose={() => setPendingClear(null)}>
+          <p className="text-body-md text-muted">
+            {pendingClear
+              ? '将删除已缓存的播放分片，之前看过的内容需要重新加载。'
+              : '将删除全部已下载的影片，删除后需要重新下载才能离线观看。'}
           </p>
           <div className="mt-4 flex justify-end gap-2">
-            <button onClick={() => setConfirm(null)} className="tap rounded-lg px-3 py-2 text-label-lg text-muted">
+            <button onClick={() => setPendingClear(null)} className="tap rounded-lg px-3 py-2 text-label-lg text-muted">
               取消
             </button>
-            <button onClick={doClear} className="tap rounded-lg px-3 py-2 text-label-lg text-danger">
-              确认清理
+            <button onClick={() => void clear(pendingClear)} className="tap rounded-lg px-3 py-2 text-label-lg text-danger">
+              清理
             </button>
           </div>
         </Dialog>
@@ -142,36 +128,46 @@ export default function CachePage() {
   )
 }
 
+function SettingsGroup({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <p className="px-[30px] pb-1.5 pt-3.5 text-label-md text-muted">{title}</p>
+      <div className="mx-4 overflow-hidden rounded-card bg-surface">{children}</div>
+    </section>
+  )
+}
+
 function CacheRow({
   title,
   subtitle,
   value,
   action,
+  danger,
   onAction,
-  onOpen,
   last,
 }: {
   title: string
   subtitle: string
-  value: string
+  value?: string
   action?: string
+  danger?: boolean
   onAction?: () => void
-  onOpen?: () => void
   last?: boolean
 }) {
   return (
     <div>
-      <div className="flex min-h-[56px] items-center px-4 py-2.5">
-        <button onClick={onOpen} className={`min-w-0 flex-1 text-left ${onOpen ? 'tap' : ''}`}>
+      <div className={`flex min-h-[56px] items-center px-4 py-2.5 ${onAction ? 'tap cursor-pointer' : ''}`} onClick={onAction}>
+        <div className="min-w-0 flex-1">
           <p className="text-title-sm text-ink">{title}</p>
-          <p className="mt-0.5 line-clamp-2 text-label-sm text-muted">{subtitle}</p>
-        </button>
-        <span className="ml-3 shrink-0 text-label-md text-muted">{value}</span>
-        {action && onAction && (
-          <button onClick={onAction} className="tap ml-2 shrink-0 px-1 py-2 text-label-md text-brand">
+          <p className="mt-0.5 truncate text-label-sm text-muted">{subtitle}</p>
+        </div>
+        {value && <span className="ml-3 shrink-0 text-label-md text-muted">{value}</span>}
+        {action && (
+          <span className={`ml-3 shrink-0 text-label-md ${danger ? 'text-danger' : 'text-brand'}`}>
             {action}
-          </button>
+          </span>
         )}
+        {onAction && <Icon name="chevron" size={18} className="ml-1 text-muted/70" />}
       </div>
       {!last && <div className="ml-4 h-px bg-divider" />}
     </div>

@@ -73,9 +73,6 @@ export default function Search() {
               <Icon name="close" size={16} />
             </button>
           )}
-          <button onClick={() => submit()} className="tap ml-1.5 text-label-md text-brand">
-            搜索
-          </button>
         </div>
       </div>
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { useLiveQuery } from 'dexie-react-hooks'
 import { db } from '../lib/db'
@@ -15,6 +15,7 @@ import { enqueue, offlineVod, spaceWarning } from '../lib/downloads'
 import type { Episode, PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import {
+  BackToTopButton,
   DownloadedBadge,
   EmptyBox,
   ErrorBox,
@@ -42,6 +43,8 @@ export default function Detail() {
   const [sheetOpen, setSheetOpen] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
   const [reloadKey, setReloadKey] = useState(0)
+  const [showTop, setShowTop] = useState(false)
+  const scrollRef = useRef<HTMLDivElement>(null)
 
   const history = useLiveQuery(() => db.history.get(vodId), [vodId], undefined)
   const favoriteRow = useLiveQuery(() => db.favorites.get(vodId), [vodId], undefined)
@@ -208,9 +211,20 @@ export default function Detail() {
 
   return (
     <PageShell>
-      <div className="flex h-full flex-col bg-bg">
+      <div className="relative flex h-full flex-col bg-bg">
         <ScreenTopBar title={vod?.name || ''} onBack={goBack} />
-        <div className="min-h-0 flex-1 overflow-y-auto no-scrollbar">{content}</div>
+        <div
+          ref={scrollRef}
+          onScroll={(e) => setShowTop(e.currentTarget.scrollTop > 600)}
+          className="min-h-0 flex-1 overflow-y-auto no-scrollbar"
+        >
+          {content}
+        </div>
+        {showTop && (
+          <BackToTopButton
+            onClick={() => scrollRef.current?.scrollTo({ top: 0, behavior: 'smooth' })}
+          />
+        )}
       </div>
 
       {showPoster && vod && <PosterPreview url={vod.poster} name={vod.name} onClose={() => setShowPoster(false)} />}
@@ -432,27 +446,92 @@ function DetailContent({
 
 function Synopsis({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false)
+  const [overflow, setOverflow] = useState(false)
+  const textRef = useRef<HTMLParagraphElement>(null)
+
+  // 原生用 onTextLayout.hasVisualOverflow：短简介不显示「展开」，这里用 DOM 量一次等价判断。
+  useEffect(() => {
+    if (expanded) return
+    const el = textRef.current
+    if (el) setOverflow(el.scrollHeight > el.clientHeight + 1)
+  }, [text, expanded])
+
   return (
     <div className="px-4">
-      <p className={`text-body-md leading-[19px] text-muted ${expanded ? '' : 'line-clamp-3'}`}>{text}</p>
-      <div className="flex justify-end">
-        <button
-          onClick={() => setExpanded((v) => !v)}
-          className="tap pt-1.5 text-label-md text-brand"
-        >
-          {expanded ? '收起' : '展开'}
-        </button>
-      </div>
+      <p
+        ref={textRef}
+        className={`text-body-md leading-[19px] text-muted ${expanded ? '' : 'line-clamp-3'}`}
+      >
+        {text}
+      </p>
+      {(overflow || expanded) && (
+        <div className="flex justify-end">
+          <button
+            onClick={() => setExpanded((v) => !v)}
+            className="tap pt-1.5 text-label-md text-brand"
+          >
+            {expanded ? '收起' : '展开'}
+          </button>
+        </div>
+      )}
     </div>
   )
 }
 
-/** 集名越长列数越少：综艺那套「20261024第3期上·偷题猜词纯享」在 4 列下会被截得一模一样。 */
-function episodeColumns(episodes: Episode[]): number {
-  const longest = episodes.reduce((max, e) => Math.max(max, e.name.length), 0)
-  if (longest > 16) return 2
-  if (longest > 9) return 3
-  return 4
+interface EpisodeLayout {
+  columns: number
+  rowHeight: number
+  lines: number
+}
+
+/**
+ * 对齐原生 rememberEpisodeLayout：用真实文本测量决定列数，
+ * 从 4 列往 2 列退让直到最长集名能在 maxLines 行内排完，所有格子共用同一行高。
+ */
+function measureEpisodeLayout(
+  names: string[],
+  maxColumns: number,
+  minColumns: number,
+  maxLines: number,
+  minRowHeight: number,
+  fontPx: number,
+  lineHeightPx: number,
+): EpisodeLayout {
+  const available = Math.min(typeof window === 'undefined' ? 420 : window.innerWidth, 480) - 32
+  const canvas = document.createElement('canvas')
+  const ctx = canvas.getContext('2d')
+  if (ctx) ctx.font = `500 ${fontPx}px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif`
+
+  const linesFor = (name: string, cellWidth: number): number => {
+    const width = cellWidth - 10 // 卡片左右各 4dp + 2dp 余量
+    if (!ctx || width <= 0) return maxLines
+    let lines = 1
+    let current = ''
+    for (const char of name) {
+      const next = current + char
+      if (ctx.measureText(next).width > width && current) {
+        lines++
+        current = char
+      } else {
+        current = next
+      }
+    }
+    return lines
+  }
+
+  let columns = maxColumns
+  let lines = names.reduce((max, name) => {
+    const cell = (available - 8 * (columns - 1)) / columns
+    return Math.max(max, linesFor(name, cell))
+  }, 1)
+  while (lines > maxLines && columns > minColumns) {
+    columns--
+    lines = names.reduce((max, name) => {
+      const cell = (available - 8 * (columns - 1)) / columns
+      return Math.max(max, linesFor(name, cell))
+    }, 1)
+  }
+  return { columns, lines, rowHeight: Math.max(minRowHeight, lineHeightPx * lines + 10) }
 }
 
 function EpisodeGrid({
@@ -472,9 +551,24 @@ function EpisodeGrid({
   watched: Record<number, number>
   onPlay: (source: number, episode: number) => void
 }) {
-  const columns = episodeColumns(episodes)
+  const layout = useMemo(
+    () =>
+      measureEpisodeLayout(
+        episodes.map((e) => e.name),
+        4,
+        2,
+        3,
+        46,
+        14,
+        20,
+      ),
+    [episodes],
+  )
   return (
-    <div className="grid gap-2 px-4" style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}>
+    <div
+      className="grid gap-2 px-4"
+      style={{ gridTemplateColumns: `repeat(${layout.columns}, minmax(0, 1fr))` }}
+    >
       {episodes.map((episode) => {
         const playing = historySource === sourceIndex && historyEpisode === episode.index
         const progress = watched[episode.index]
@@ -482,15 +576,26 @@ function EpisodeGrid({
           <button
             key={episode.index}
             onClick={() => onPlay(sourceIndex, episode.index)}
-            className={`tap relative flex min-h-[46px] items-center justify-center rounded-lg px-1 py-1.5 ${
+            className={`tap relative flex items-center justify-center rounded-lg px-1 py-1.5 ${
               playing
                 ? 'bg-brand text-white'
                 : progress != null
                   ? 'bg-surface-high/55 text-ink/45'
                   : 'bg-surface-high text-ink'
             }`}
+            style={{ height: layout.rowHeight }}
           >
-            <span className="line-clamp-3 text-center text-label-lg">{episode.name}</span>
+            <span
+              className="text-center text-label-lg"
+              style={{
+                display: '-webkit-box',
+                WebkitLineClamp: layout.lines,
+                WebkitBoxOrient: 'vertical',
+                overflow: 'hidden',
+              }}
+            >
+              {episode.name}
+            </span>
             {downloaded.has(episode.index) && (
               <span className="absolute right-1 top-1">
                 <DownloadedBadge light={playing} />
@@ -526,7 +631,19 @@ function DownloadSheet({
   onConfirm: () => void
   onClose: () => void
 }) {
-  const columns = episodeColumns(episodes)
+  const layout = useMemo(
+    () =>
+      measureEpisodeLayout(
+        episodes.map((e) => e.name),
+        4,
+        2,
+        2,
+        40,
+        12,
+        16,
+      ),
+    [episodes],
+  )
   return (
     <div className="fixed inset-0 z-50 flex flex-col justify-end bg-black/55" onClick={onClose}>
       <div
@@ -541,7 +658,7 @@ function DownloadSheet({
         </div>
         <div
           className="mt-2.5 grid max-h-[360px] gap-2 overflow-y-auto no-scrollbar"
-          style={{ gridTemplateColumns: `repeat(${columns}, minmax(0, 1fr))` }}
+          style={{ gridTemplateColumns: `repeat(${layout.columns}, minmax(0, 1fr))` }}
         >
           {episodes.map((episode) => {
             const done = downloaded.has(episode.index)
@@ -550,15 +667,25 @@ function DownloadSheet({
               <button
                 key={episode.index}
                 onClick={() => onToggle(episode.index)}
-                className={`tap flex min-h-[40px] items-center justify-center rounded-lg px-1 py-1 text-center text-label-md ${
+                className={`tap flex items-center justify-center rounded-lg px-1 py-1 text-center text-label-md ${
                   done
                     ? 'bg-surface-high/50 text-muted'
                     : active
                       ? 'bg-brand/18 text-brand'
                       : 'bg-surface-high text-ink'
                 }`}
+                style={{ height: layout.rowHeight }}
               >
-                <span className="line-clamp-2">{episode.name}</span>
+                <span
+                  style={{
+                    display: '-webkit-box',
+                    WebkitLineClamp: layout.lines,
+                    WebkitBoxOrient: 'vertical',
+                    overflow: 'hidden',
+                  }}
+                >
+                  {episode.name}
+                </span>
               </button>
             )
           })}
@@ -600,19 +727,78 @@ function Modal({
 }
 
 function PosterPreview({ url, name, onClose }: { url: string; name: string; onClose: () => void }) {
+  // 对齐原生 PosterPreviewDialog：双击 1x↔2.5x、双指缩放（最大 4x）、一键保存
+  const [scale, setScale] = useState(1)
+  const pointers = useRef(new Map<number, { x: number; y: number }>())
+  const pinch = useRef({ distance: 0, scale: 1 })
+
+  const distance = () => {
+    const [a, b] = Array.from(pointers.current.values())
+    return a && b ? Math.hypot(a.x - b.x, a.y - b.y) : 0
+  }
+
+  const save = () => {
+    const anchor = document.createElement('a')
+    anchor.href = imgUrl(url)
+    anchor.download = `追影-${name}.jpg`
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+  }
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/95" onClick={onClose}>
-      <img
-        src={imgUrl(url)}
-        alt={name}
-        className="max-h-[86vh] max-w-[92vw] rounded-lg object-contain animate-fade-in"
-      />
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/95">
+      <div
+        className="flex max-h-[86vh] max-w-[92vw] items-center justify-center overflow-hidden"
+        style={{ touchAction: 'none' }}
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={() => setScale((s) => (s > 1 ? 1 : 2.5))}
+        onPointerDown={(e) => {
+          e.currentTarget.setPointerCapture?.(e.pointerId)
+          pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+          if (pointers.current.size === 2) {
+            pinch.current = { distance: distance(), scale }
+          }
+        }}
+        onPointerMove={(e) => {
+          if (!pointers.current.has(e.pointerId)) return
+          pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
+          if (pointers.current.size === 2 && pinch.current.distance > 0) {
+            setScale(
+              Math.min(4, Math.max(1, pinch.current.scale * (distance() / pinch.current.distance))),
+            )
+          }
+        }}
+        onPointerUp={(e) => {
+          pointers.current.delete(e.pointerId)
+          if (pointers.current.size < 2) pinch.current.distance = 0
+        }}
+        onPointerCancel={(e) => {
+          pointers.current.delete(e.pointerId)
+          pinch.current.distance = 0
+        }}
+      >
+        <img
+          src={imgUrl(url)}
+          alt={name}
+          className="max-h-[86vh] max-w-[92vw] rounded-lg object-contain animate-fade-in"
+          style={{ transform: `scale(${scale})` }}
+          draggable={false}
+        />
+      </div>
       <button
         onClick={onClose}
         aria-label="关闭"
-        className="tap absolute right-4 top-4 flex h-10 w-10 items-center justify-center rounded-full bg-white/10 text-white"
+        className="tap absolute left-3 top-3 flex h-10 w-10 items-center justify-center rounded-full bg-black/50 text-white"
       >
         <Icon name="close" size={22} />
+      </button>
+      <button
+        onClick={save}
+        aria-label="保存到相册"
+        className="tap absolute bottom-5 right-4 flex h-11 w-11 items-center justify-center rounded-full bg-black/50 text-white"
+      >
+        <Icon name="download" size={22} />
       </button>
     </div>
   )

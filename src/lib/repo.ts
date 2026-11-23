@@ -1,4 +1,4 @@
-import { db } from './db'
+import { db, prunePageCache } from './db'
 import { ApiException, fetchHtml, request } from './api'
 import {
   cleanText,
@@ -40,6 +40,7 @@ async function readCache(key: string): Promise<{ json: string; savedAt: number }
 
 async function writeCache(key: string, json: string) {
   await db.pageCache.put({ key, json, savedAt: Date.now() })
+  void prunePageCache().catch(() => undefined)
 }
 
 export async function clearPageCache() {

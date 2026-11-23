@@ -79,14 +79,14 @@ export function Icon({ name, size = 22, outlined, className, ...rest }: IconProp
   )
 }
 
-/** 播放页中央的脉冲图标（双击播放/暂停反馈）。 */
-export function PulseIcon({ playing, size = 76 }: { playing: boolean; size?: number }) {
+/** 播放页中央的脉冲图标（双击反馈）。参数 willPlay：要播放→两道杠，要暂停→三角，与原版一致。 */
+export function PulseIcon({ playing: willPlay, size = 76 }: { playing: boolean; size?: number }) {
   return (
     <div
       className="animate-pulse-icon flex items-center justify-center rounded-full bg-black/45 text-white"
       style={{ width: size, height: size }}
     >
-      <Icon name={playing ? 'play' : 'pause'} size={size * 0.5} />
+      <Icon name={willPlay ? 'pause' : 'play'} size={size * 0.5} />
     </div>
   )
 }

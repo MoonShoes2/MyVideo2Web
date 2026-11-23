@@ -8,7 +8,6 @@ import {
   fetchDetail,
   getHistory,
   saveProgress,
-  toggleFavorite,
   trimHistory,
 } from '../lib/repo'
 import {
@@ -20,7 +19,7 @@ import {
 } from '../lib/parse'
 import { offlineVod } from '../lib/downloads'
 import { resolveAdRanges, inRange, type AdRange } from '../lib/ads'
-import { getSettings, SPEED_OPTIONS, useSettings } from '../lib/settings'
+import { getSettings, PLAYER_SPEED_OPTIONS, useSettings } from '../lib/settings'
 import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
@@ -31,6 +30,38 @@ const CONTROLS_AUTO_HIDE_MS = 4000
 const PROGRESS_SAVE_INTERVAL_MS = 5000
 const SCREEN_SEEK_SPAN_MS = 5 * 60_000
 const MIN_BRIGHTNESS = 0.02
+/** 片尾广告离片尾多近就算「这一集播完了」——此时直接进下一集，而不是 seek 到片尾 */
+const TAIL_AD_THRESHOLD_MS = 1_500
+/** 原生把双击判定窗口从系统的 300ms 放宽到 500ms，兼容长按加速抬手后的点击。 */
+const DOUBLE_TAP_WINDOW_MS = 500
+
+/** 播放错误文案：对齐原生的「人话错误」，不把 hls.js / MediaError 的码直接丢给用户。 */
+function describePlaybackError(kind: 'network' | 'media' | 'unsupported' | 'other'): string {
+  switch (kind) {
+    case 'network':
+      return '网络连接失败，请检查网络后重试'
+    case 'media':
+      return '播放地址已失效或解码失败，试试切换线路'
+    case 'unsupported':
+      return '当前浏览器不支持该播放格式'
+    default:
+      return '播放失败，请重试或切换线路'
+  }
+}
+
+function describeMediaError(code?: number): string {
+  switch (code) {
+    case 1:
+      return '播放被中断，请重试'
+    case 2:
+    case 4:
+      return describePlaybackError('media')
+    case 3:
+      return describePlaybackError('media')
+    default:
+      return describePlaybackError('other')
+  }
+}
 
 interface Hud {
   type: 'brightness' | 'volume'
@@ -51,9 +82,15 @@ export default function Player() {
   const [startPositionMs, setStartPositionMs] = useState(0)
   const [playToken, setPlayToken] = useState(0)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // 播放中途的错误：vod 已加载，不能复用 loadError 的全屏「加载失败」页，
+  // 否则用户只会看到一块黑屏（原生这一段是 PlaybackErrorOverlay）。
+  const [playbackError, setPlaybackError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [buffering, setBuffering] = useState(false)
+  const [showBufferSpinner, setShowBufferSpinner] = useState(false)
   const [playing, setPlaying] = useState(false)
+  // 首帧就绪：起播前的黑屏期显示品牌色加载圈（对齐原生 LoadingOverlay）
+  const [firstFrame, setFirstFrame] = useState(false)
   const [positionMs, setPositionMs] = useState(0)
   const [durationMs, setDurationMs] = useState(0)
   const [bufferedMs, setBufferedMs] = useState(0)
@@ -62,9 +99,9 @@ export default function Player() {
   const [controlsVisible, setControlsVisible] = useState(true)
   const [panelOpen, setPanelOpen] = useState(false)
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false)
-  const [favorite, setFavorite] = useState(false)
   const [hud, setHud] = useState<Hud | null>(null)
   const [pulse, setPulse] = useState<{ playing: boolean; seq: number } | null>(null)
+  const [boosting, setBoosting] = useState(false)
   const [brightness, setBrightness] = useState(1)
   const [seekPreview, setSeekPreview] = useState<number | null>(null)
   const [adRanges, setAdRanges] = useState<AdRange[]>([])
@@ -102,17 +139,26 @@ export default function Player() {
   }
   const [videoPortrait, setVideoPortrait] = useState<boolean | null>(() => readOrientation(vodId))
 
+  // 是否真正进入过全屏：比 videoPortrait 更可靠的「横屏播放中」信号，
+  // 拿不到视频宽高时也能正确识别系统返回键退出全屏。
+  const wasFullscreenRef = useRef(false)
+  // 主动离开标记：顶栏返回 / 组件卸载时我们主动退出全屏，
+  // fullscreenchange 会因此再触发一次，用这个标记避免重复 navigate。
+  const leavingRef = useRef(false)
+
   /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
   const enterLandscape = useCallback(async () => {
     const el = stageRef.current
     try {
       if (el && !document.fullscreenElement) await el.requestFullscreen()
+      wasFullscreenRef.current = true
       await screen.orientation?.lock?.('landscape')
     } catch {
       /* 桌面端没有 lock；非用户手势内请求全屏会被拒 */
     }
   }, [])
   const hlsRef = useRef<Hls | null>(null)
+  const tailAdHandledRef = useRef(false)
   const positionRef = useRef(0)
   const durationRef = useRef(0)
   const stateRef = useRef({ sourceIndex: 0, episodeIndex: 0, vod: null as Vod | null, sources: [] as PlaySource[] })
@@ -187,7 +233,6 @@ export default function Player() {
   }, [vodId])
 
   useEffect(() => {
-    db.favorites.get(vodId).then((row) => setFavorite(row != null))
     db.episodeHistory
       .where('vodId')
       .equals(vodId)
@@ -225,9 +270,12 @@ export default function Player() {
     hlsRef.current?.destroy()
     hlsRef.current = null
     setBuffering(false)
+    setFirstFrame(false)
     setPositionMs(0)
     setDurationMs(0)
     setSeekPreview(null)
+    setPlaybackError(null)
+    tailAdHandledRef.current = false
 
     const startAt = startPositionMs / 1000
     const onMeta = () => {
@@ -236,6 +284,9 @@ export default function Player() {
         const portrait = video.videoHeight >= video.videoWidth
         setVideoPortrait(portrait)
         rememberOrientation(vodId, portrait)
+        // 每次进页都按实测方向转一次：若记忆值与实测相同，state 不会变、effect 不重跑，
+        // 所以在这里直接触发，保证「返回再进」同样自动旋转。
+        if (!portrait) enterLandscape().catch(() => undefined)
       }
       if (startAt > 0 && Math.abs(video.currentTime - startAt) > 1) video.currentTime = startAt
       video.playbackRate = speed
@@ -252,14 +303,21 @@ export default function Player() {
         video.playbackRate = speed
         video.play().catch(() => setNeedsTap(true))
       })
+      // 与原生一致：先自恢复两次，仍失败才把错误交给用户（重试 / 换线路）
+      let networkRetries = 0
+      let mediaRetries = 0
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return
-        if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        if (data.type === Hls.ErrorTypes.NETWORK_ERROR && networkRetries++ < 2) {
           hls.startLoad()
-        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRetries++ < 2) {
           hls.recoverMediaError()
+        } else if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          setPlaybackError(describePlaybackError('network'))
+        } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+          setPlaybackError(describePlaybackError('media'))
         } else {
-          setLoadError('播放失败，请切换线路或稍后重试')
+          setPlaybackError(describePlaybackError('other'))
         }
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
@@ -278,9 +336,12 @@ export default function Player() {
   }, [episode?.url, playToken])
 
   // ── 播放器事件 ──
+  // 关键：初次渲染是「正在获取播放地址」全屏加载页，<video> 还没挂载，
+  // 若在 [] 阶段绑定会拿到 null 且永不重绑，play/pause/waiting 全部丢失。
+  // 用 vod 驱动：详情解析成功、video 进入 DOM 后再绑定一次。
   useEffect(() => {
     const video = videoRef.current
-    if (!video) return
+    if (!video || !vod) return
     const onTime = () => {
       positionRef.current = video.currentTime * 1000
       setPositionMs(video.currentTime * 1000)
@@ -298,9 +359,13 @@ export default function Player() {
     }
     const onPause = () => setPlaying(false)
     const onWaiting = () => setBuffering(true)
-    const onPlaying = () => setBuffering(false)
+    const onPlaying = () => {
+      setBuffering(false)
+      setFirstFrame(true)
+    }
     const onError = () => {
-      if (!hlsRef.current) setLoadError('播放失败，请切换线路或稍后重试')
+      // hls.js 的致命错误由它自己的 ERROR 事件处理；这里兜底原生 HLS / 直接 mp4。
+      if (!hlsRef.current) setPlaybackError(describeMediaError(video.error?.code))
     }
     video.addEventListener('timeupdate', onTime)
     video.addEventListener('progress', onTime)
@@ -322,7 +387,7 @@ export default function Player() {
       video.removeEventListener('playing', onPlaying)
       video.removeEventListener('error', onError)
     }
-  }, [])
+  }, [vod])
 
   // 倍速跟随设置/用户选择
   useEffect(() => {
@@ -333,7 +398,8 @@ export default function Player() {
   const persistProgress = useCallback(() => {
     const { vod: currentVod, sources: currentSources, sourceIndex: si, episodeIndex: ei } = stateRef.current
     const video = videoRef.current
-    if (!currentVod || !video) return
+    // 原生只在正在播放时落库，暂停/缓冲期间的同一帧不重复写
+    if (!currentVod || !video || video.paused) return
     const src = currentSources[si]
     const ep = src?.episodes[ei]
     if (!src || !ep) return
@@ -351,6 +417,15 @@ export default function Player() {
     }).catch(() => undefined)
   }, [])
 
+  // 统一的「返回上一页」：保存进度后返回。横屏片源在系统返回键退出全屏时复用它。
+  const leavePlayer = useCallback(() => {
+    if (leavingRef.current) return
+    leavingRef.current = true
+    wasFullscreenRef.current = false
+    persistProgress()
+    navigate(-1)
+  }, [persistProgress, navigate])
+
   useEffect(() => {
     const timer = window.setInterval(persistProgress, PROGRESS_SAVE_INTERVAL_MS)
     return () => {
@@ -358,6 +433,16 @@ export default function Player() {
       persistProgress()
     }
   }, [persistProgress])
+
+  // 缓冲圈延迟点亮：短促的 seek 抖动不闪圈（原生 BUFFER_SPINNER_DELAY_MS = 300）
+  useEffect(() => {
+    if (!buffering || playbackError != null) {
+      setShowBufferSpinner(false)
+      return
+    }
+    const timer = window.setTimeout(() => setShowBufferSpinner(true), 300)
+    return () => window.clearTimeout(timer)
+  }, [buffering, playbackError])
 
   // ── 广告区间 ──
   useEffect(() => {
@@ -392,14 +477,42 @@ export default function Player() {
       const video = videoRef.current
       if (!video || video.paused || video.seeking) return
       const pos = video.currentTime * 1000
-      const range = inRange(adRanges, pos)
+      // 原生 AD_SKIP_LEAD_MS = 300：提前一点触发，避免慢设备上闪出广告首帧
+      const range =
+        inRange(adRanges, pos) ??
+        adRanges.find((r) => pos >= r.startMs - 300 && pos < r.startMs) ??
+        null
       if (!range) return
+
+      // 片尾广告 = 这一集已经播完；仅在开启自动连播时推进下一集（对齐原生）
+      const duration = Number.isFinite(video.duration) ? video.duration * 1000 : 0
+      if (
+        settings.autoPlayNext &&
+        duration > 0 &&
+        range.endMs >= duration - TAIL_AD_THRESHOLD_MS &&
+        !tailAdHandledRef.current
+      ) {
+        tailAdHandledRef.current = true
+        nextEpisode(true)
+        return
+      }
+
+      // 先暂停再 seek，等 seeked 后恢复播放：避免慢设备上闪一帧广告
       setAdSkipping(true)
+      video.pause()
+      const skippedSeconds = Math.max(1, Math.round((range.endMs - pos) / 1000))
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked)
+        video.play().catch(() => undefined)
+        setAdSkipping(false)
+        showToast(`已跳过 ${skippedSeconds} 秒广告`)
+      }
+      video.addEventListener('seeked', onSeeked)
       video.currentTime = Math.min((range.endMs + 250) / 1000, video.duration || Infinity)
-      window.setTimeout(() => setAdSkipping(false), 700)
-    }, 200)
+    }, 100)
     return () => window.clearInterval(timer)
-  }, [adRanges])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [adRanges, settings.autoPlayNext, showToast])
 
   // ── 控制层自动隐藏 ──
   const bumpControls = useCallback(() => {
@@ -484,9 +597,19 @@ export default function Player() {
   }
 
   // 横屏片源自动转横屏（对齐原版 SCREEN_ORIENTATION_SENSOR_LANDSCAPE）
+  // 必须等 loading 结束、stage 挂载后再请求：有方向记忆时 videoPortrait 初值就是 false，
+  // 若在 loading 阶段触发，stageRef 还是 null，requestFullscreen 直接失败且之后再不触发。
   useEffect(() => {
+    if (loading || !vod) return
     if (videoPortrait === false) enterLandscape().catch(() => undefined)
-  }, [videoPortrait, enterLandscape])
+  }, [loading, vod, videoPortrait, enterLandscape])
+
+  // StrictMode 开发模式会 mount→unmount→remount；每次挂载都重置主动离开标记，
+  // 否则第一次 unmount 置的 true 会残留到 remount，导致返回按钮/自动返回全部失效。
+  useEffect(() => {
+    leavingRef.current = false
+    wasFullscreenRef.current = false
+  }, [])
 
   // 离开全屏时解除方向锁；卸载时兜底还原（对齐原版 exitPlayer 回竖屏）
   useEffect(() => {
@@ -498,12 +621,34 @@ export default function Player() {
       }
     }
     const onFsChange = () => {
-      if (!document.fullscreenElement) unlock()
+      if (document.fullscreenElement) {
+        // 进入全屏（横屏片源自动转的），记下来；系统返回键退出时据此判断
+        wasFullscreenRef.current = true
+        return
+      }
+      unlock()
+      // 横屏片源在系统返回键 / 手势下会被浏览器先退出全屏（Web 收不到返回事件），
+      // 表现为「点一次返回变竖屏继续播」。这里检测到从全屏退出就直接回上一页。
+      // 用 wasFullscreen 而不是 videoPortrait：拿不到视频宽高时也能正确识别。
+      // leavingRef 排除我们主动退出的情况（顶栏返回、组件卸载）。
+      if (!leavingRef.current && wasFullscreenRef.current && vod && !loading) {
+        leavePlayer()
+      }
     }
     document.addEventListener('fullscreenchange', onFsChange)
+    return () => document.removeEventListener('fullscreenchange', onFsChange)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [leavePlayer, videoPortrait, vod, loading])
+
+  // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
+  useEffect(() => {
     return () => {
-      document.removeEventListener('fullscreenchange', onFsChange)
-      unlock()
+      leavingRef.current = true
+      try {
+        screen.orientation?.unlock?.()
+      } catch {
+        /* 未锁定时 unlock 会抛错，忽略 */
+      }
       if (document.fullscreenElement) document.exitFullscreen().catch(() => undefined)
     }
   }, [])
@@ -530,6 +675,7 @@ export default function Player() {
     setPlayToken((t) => t + 1)
     setPanelOpen(false)
     setLoadError(null)
+    setPlaybackError(null)
     if (hideTimer.current) window.clearTimeout(hideTimer.current)
     bumpControls()
   }
@@ -540,6 +686,23 @@ export default function Player() {
       return
     }
     jumpTo(sourceIndex, episodeIndex + 1)
+  }
+
+  /** 播放中失败后的两个出口：重试当前集 / 切到下一条可用线路。 */
+  const retryPlayback = () => {
+    setPlaybackError(null)
+    setPlayToken((t) => t + 1)
+    bumpControls()
+  }
+
+  const switchLine = () => {
+    const next = sources.findIndex((_, i) => i !== sourceIndex)
+    if (next < 0) {
+      showToast('当前没有可切换的线路')
+      return
+    }
+    const episode = Math.min(episodeIndex, (sources[next]?.episodes.length ?? 1) - 1)
+    jumpTo(next, Math.max(0, episode))
   }
 
   const onEnded = () => {
@@ -598,6 +761,10 @@ export default function Player() {
       g.axis = null
       setSeekPreview(null)
       setHud(null)
+      setBoosting(true)
+      // 原生 boost 时控制层整体让位，只留「2× 快进中」胶囊
+      setControlsVisible(false)
+      if (hideTimer.current) window.clearTimeout(hideTimer.current)
       if (video.paused) video.play().catch(() => undefined)
       video.playbackRate = BOOST_SPEED
     }, BOOST_DELAY_MS)
@@ -645,6 +812,7 @@ export default function Player() {
 
     if (g.boosted) {
       g.boosted = false
+      setBoosting(false)
       video.playbackRate = speed
       setControlsVisible(false)
       // 长按抬手后紧跟的一下点击不能算双击
@@ -670,14 +838,14 @@ export default function Player() {
 
     // 单击 / 双击判定：双击播放暂停，单击显隐控制层
     const now = Date.now()
-    if (now - g.lastTap < 300) {
+    if (now - g.lastTap < DOUBLE_TAP_WINDOW_MS) {
       if (g.singleTapTimer) window.clearTimeout(g.singleTapTimer)
       g.lastTap = 0
       const willPlay = video.paused
       if (willPlay) video.play().catch(() => undefined)
       else video.pause()
       setPulse({ playing: willPlay, seq: now })
-      window.setTimeout(() => setPulse(null), 640)
+      window.setTimeout(() => setPulse(null), 620)
       return
     }
     g.lastTap = now
@@ -701,6 +869,16 @@ export default function Player() {
     if (!video) return
     video.currentTime = ms / 1000
     setPositionMs(ms)
+  }
+
+  // 原生加载态文案：正在获取播放地址…（带品牌色转圈）
+  if (loading && !vod && !loadError) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black">
+        <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
+        <p className="mt-4 text-body-md text-white/70">正在获取播放地址…</p>
+      </div>
+    )
   }
 
   if (loadError && !vod) {
@@ -755,6 +933,24 @@ export default function Player() {
         onClick={(e) => e.stopPropagation()}
       />
 
+      {/* 播放中失败：vod 已在手，用浮层给出人话错误 + 重试 / 换线路两个出口 */}
+      {playbackError && (
+        <div className="absolute inset-0 z-[45] flex items-center justify-center bg-black/80 px-10">
+          <div className="rounded-xl bg-black/78 px-5 py-4 text-center">
+            <Icon name="offline" size={46} className="text-white/55" />
+            <p className="mt-2 text-body-sm text-white/75">{playbackError}</p>
+            <div className="mt-4 flex justify-center gap-6">
+              <button onClick={retryPlayback} className="tap text-label-lg text-white">
+                重试
+              </button>
+              <button onClick={switchLine} className="tap text-label-lg text-brand">
+                换线路
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* 亮度遮罩：网页改不了屏幕背光，用一层黑幕等价表达「画面变暗」 */}
       <div
         className="pointer-events-none absolute inset-0 bg-black transition-opacity"
@@ -764,8 +960,16 @@ export default function Player() {
       {pulse && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <div className="animate-pulse-icon flex h-[76px] w-[76px] items-center justify-center rounded-full bg-black/45 text-white">
-            <Icon name={pulse.playing ? 'play' : 'pause'} size={38} />
+            {/* 原生 pulseShowPlay = !willPlay：要播放→画两道杠(可暂停)，要暂停→画三角(可播放) */}
+            <Icon name={pulse.playing ? 'pause' : 'play'} size={38} />
           </div>
+        </div>
+      )}
+
+      {/* 长按加速提示：固定在左上角，不挡画面中心（对齐原生 SpeedBoostChip） */}
+      {boosting && (
+        <div className="pointer-events-none absolute left-3 top-3 z-30 rounded-xl bg-black/62 px-2.5 py-1 text-label-md text-white">
+          {formatSpeed(BOOST_SPEED)}× 快进中
         </div>
       )}
 
@@ -778,6 +982,14 @@ export default function Player() {
             </div>
             <span className="mt-1.5 text-label-md">{Math.round(hud.value * 100)}%</span>
           </div>
+        </div>
+      )}
+
+      {/* 起播前加载：详情/线路已就绪但首帧还没到，显示品牌色转圈（原生 LoadingOverlay） */}
+      {vod && !firstFrame && !needsTap && !loadError && !playbackError && (
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-black">
+          <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
+          <p className="mt-4 text-body-md text-white/70">正在获取播放地址…</p>
         </div>
       )}
 
@@ -798,7 +1010,8 @@ export default function Player() {
         </button>
       )}
 
-      {buffering && !loadError && (
+      {/* 播放中缓冲才用白色圈；起播前由上面的品牌色 LoadingOverlay 独占，避免两个圈同时转 */}
+      {showBufferSpinner && firstFrame && !loadError && !playbackError && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-white/80 border-t-transparent" />
         </div>
@@ -820,6 +1033,7 @@ export default function Player() {
         onPointerCancel={() => {
           gesture.current.down = false
           gesture.current.boosted = false
+          setBoosting(false)
           setSeekPreview(null)
         }}
       />
@@ -835,42 +1049,16 @@ export default function Player() {
               title={vod?.name ?? ''}
               episodeName={episode?.name ?? ''}
               locked={locked}
-              onBack={() => {
-                persistProgress()
-                navigate(-1)
-              }}
+              onBack={leavePlayer}
               onToggleLock={() => {
                 setLocked((v) => !v)
                 setControlsVisible(true)
                 showToast(locked ? '已解锁' : '已锁定，点击右上角解锁')
               }}
-              onFavorite={
-                vod
-                  ? () => {
-                      toggleFavorite(vod)
-                      setFavorite((v) => !v)
-                    }
-                  : undefined
-              }
-              favorite={favorite}
             />
           </div>
 
-          {locked && (
-            <button
-              onClick={() => {
-                setLocked(false)
-                setControlsVisible(true)
-                showToast('已解锁')
-              }}
-              className="tap absolute right-3 top-1/2 z-20 flex h-11 w-11 -translate-y-1/2 items-center justify-center rounded-full bg-black/45 text-white/90"
-              aria-label="解锁"
-            >
-              <Icon name="lock" size={22} />
-            </button>
-          )}
-
-          {!locked && (
+          {!locked && seekPreview == null && (
             <div
               className={`absolute inset-x-0 bottom-0 transition-opacity duration-200 ${
                 controlsVisible ? 'opacity-100' : 'pointer-events-none opacity-0'
@@ -891,8 +1079,23 @@ export default function Player() {
                 onNext={() => nextEpisode()}
                 onSpeed={() => setSpeedMenuOpen((v) => !v)}
                 onPlaylist={() => setPanelOpen(true)}
-                onFullscreen={toggleFullscreen}
               />
+            </div>
+          )}
+
+          {/* 横滑拖进度时，控制层隐藏也要浮出真实进度条（对齐原生 SeekPreviewOverlay） */}
+          {seekPreview != null && !locked && (
+            <div className="pointer-events-none absolute inset-x-0 bottom-0 z-30 bg-gradient-to-t from-black/85 to-transparent px-4 pb-3 pt-8">
+              <PlayerProgress
+                positionMs={seekPreview}
+                durationMs={durationMs}
+                bufferedMs={bufferedMs}
+                onSeek={() => undefined}
+              />
+              <div className="-mt-1 flex items-center justify-between text-label-md text-white/85">
+                <span>{playbackText(seekPreview)}</span>
+                <span>{durationMs > 0 ? playbackText(durationMs) : '--:--'}</span>
+              </div>
             </div>
           )}
         </>
@@ -904,7 +1107,7 @@ export default function Player() {
             className="absolute bottom-[92px] right-6 overflow-hidden rounded-xl bg-[#1A1C22]/95 py-1.5 shadow-xl"
             onClick={(e) => e.stopPropagation()}
           >
-            {SPEED_OPTIONS.map((option) => (
+            {PLAYER_SPEED_OPTIONS.map((option) => (
               <button
                 key={option}
                 onClick={() => {
@@ -948,18 +1151,14 @@ function PlayerTopBar({
   title,
   episodeName,
   locked,
-  favorite,
   onBack,
   onToggleLock,
-  onFavorite,
 }: {
   title: string
   episodeName: string
   locked: boolean
-  favorite: boolean
   onBack: () => void
   onToggleLock: () => void
-  onFavorite?: () => void
 }) {
   return (
     <div className="flex items-center bg-gradient-to-b from-black/66 to-transparent px-2 py-1.5 text-white">
@@ -970,14 +1169,6 @@ function PlayerTopBar({
             <p className="truncate text-title-sm">{title}</p>
             {episodeName && <p className="truncate text-label-sm text-white/70">{episodeName}</p>}
           </div>
-          {onFavorite && (
-            <ControlIcon
-              name={favorite ? 'heart' : 'heartOutline'}
-              label={favorite ? '取消收藏' : '收藏'}
-              onClick={onFavorite}
-              className={favorite ? 'text-gold' : ''}
-            />
-          )}
         </>
       )}
       {locked && <div className="flex-1" />}
@@ -999,7 +1190,6 @@ function PlayerBottomBar({
   onNext,
   onSpeed,
   onPlaylist,
-  onFullscreen,
 }: {
   positionMs: number
   durationMs: number
@@ -1012,7 +1202,6 @@ function PlayerBottomBar({
   onNext: () => void
   onSpeed: () => void
   onPlaylist: () => void
-  onFullscreen: () => void
 }) {
   return (
     <div className="bg-gradient-to-t from-black/80 to-transparent px-3.5 pt-5 pb-2.5 text-white">
@@ -1040,7 +1229,6 @@ function PlayerBottomBar({
         </button>
         <div className="w-2" />
         <ControlIcon name="playlist" label="选集" onClick={onPlaylist} />
-        <ControlIcon name="fullscreen" label="全屏" onClick={onFullscreen} />
       </div>
     </div>
   )
@@ -1125,19 +1313,21 @@ function PlaylistPanel({
   onClose: () => void
 }) {
   const [panelSource, setPanelSource] = useState(sourceIndex)
-  const currentRef = useRef<HTMLButtonElement>(null)
+  const gridRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (visible) setPanelSource(sourceIndex)
   }, [visible, sourceIndex])
 
   useEffect(() => {
-    if (visible) {
-      // 打开面板就定位到当前这一集，集数多的剧不用从第一集翻到第 60 集
-      window.setTimeout(() => {
-        currentRef.current?.scrollIntoView({ block: 'center', behavior: 'smooth' })
-      }, 60)
-    }
+    if (!visible) return
+    // 打开面板定位到当前集，并在上方留 3 行方便前后翻（对齐原生 PlaylistPanel）
+    window.setTimeout(() => {
+      const grid = gridRef.current
+      if (!grid) return
+      const anchor = panelSource === sourceIndex ? episodeIndex : 0
+      grid.scrollTop = Math.max(0, anchor - 3) * 56
+    }, 60)
   }, [visible, panelSource, episodeIndex, sourceIndex])
 
   if (!visible) return null
@@ -1168,14 +1358,16 @@ function PlaylistPanel({
             ))}
           </div>
         )}
-        <div className="mt-2.5 grid flex-1 auto-rows-min grid-cols-3 gap-2 overflow-y-auto no-scrollbar">
+        <div
+          ref={gridRef}
+          className="mt-2.5 grid flex-1 auto-rows-min grid-cols-3 gap-2 overflow-y-auto no-scrollbar"
+        >
           {episodes.map((ep, index) => {
             const selected = panelSource === sourceIndex && index === episodeIndex
             const progress = watchedHere[ep.index]
             return (
               <button
                 key={ep.index}
-                ref={selected ? currentRef : undefined}
                 onClick={() => onSelect(panelSource, index)}
                 className={`tap relative flex h-12 items-center justify-center rounded-lg px-1 ${
                   selected

@@ -141,6 +141,12 @@ export interface DownloadTask {
   doneSegments: number
   totalSegments: number
   bytes: number
+  /** 最近一次实测下载速度（字节/秒），下载页实时展示。 */
+  speedBytesPerSecond?: number
+  /** 已失败重试次数（最多 3 次）。 */
+  attempts?: number
+  /** 该集是否已因地址过期重建过一次。 */
+  rebuilt?: boolean
   /** 已缓存的分片地址（同源代理地址），删除时按它清 Cache Storage。 */
   segmentUrls: string[]
   error?: string

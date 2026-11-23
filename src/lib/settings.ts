@@ -1,7 +1,19 @@
 import { useEffect, useState } from 'react'
 
-/** 出厂接口地址。原工程指向的站点已关闭采集，Web 版换成一个在线的同协议源，仍可在设置里改。 */
-export const DEFAULT_BASE_URL = 'https://cj.lziapi.com/'
+/** 出厂地址与原生 build.gradle.kts 的 apiBaseUrl 保持一致；设置页可改。 */
+export const DEFAULT_BASE_URL = 'https://lzizy.net/api.php/provide/vod/'
+
+/** 采集接口固定路径，与 api.ts 的 API_PATH 一致（放这里避免 settings→api 循环依赖）。 */
+export const VOD_API_PATH = 'api.php/provide/vod/'
+
+/**
+ * 设置页展示用的完整接口地址：把 baseUrl（根路径）拼上固定路径显示给用户。
+ * 内部请求仍走 normalizeBaseUrl + 代理拼接，显示与存储分离。
+ */
+export function displayApiUrl(baseUrl: string): string {
+  const root = normalizeBaseUrl(baseUrl)
+  return root.replace(/\/$/, '') + '/' + VOD_API_PATH
+}
 
 export const THEME_SYSTEM = 0
 export const THEME_LIGHT = 1
@@ -28,13 +40,19 @@ const KEY_SKIP_ADS = 'zy.skipAds'
 const KEY_WIFI_ONLY = 'zy.wifiOnly'
 const KEY_CACHE_GB = 'zy.cacheGb'
 
-export const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2, 3]
+/** 设置页「默认倍速」：原生只到 2.0x（SettingsScreen.kt:62-69）。 */
+export const SETTINGS_SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2]
+/** 播放器倍速菜单：原生含 3.0x（PlayerScreen.kt:164），与设置页不是同一份数组。 */
+export const PLAYER_SPEED_OPTIONS = [...SETTINGS_SPEED_OPTIONS, 3]
 
 /** 允许用户把地址写成 `miuiyl.com`、`https://miuiyl.com`、带尾斜杠等多种形式。 */
 export function normalizeBaseUrl(raw: string): string {
   let url = String(raw || '').trim()
   if (!url) return DEFAULT_BASE_URL
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url
+  // 原生 MaccmsApi.normalizeBaseUrl：粘贴完整端点时从 api.php 起整段截掉，避免路径重复
+  const index = url.indexOf('api.php')
+  if (index > 0) url = url.slice(0, index)
   if (!url.endsWith('/')) url += '/'
   return url
 }

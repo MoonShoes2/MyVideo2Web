@@ -1,7 +1,8 @@
 import { db } from './db'
 import { fetchPlaylistText, hlsUrl, segUrl } from './api'
+import { fetchDetail } from './repo'
 import { getSettings } from './settings'
-import { sizeText } from './parse'
+import { parsePlaySources, sizeText } from './parse'
 import type { DownloadTask, Episode, Vod } from './types'
 
 /**
@@ -16,15 +17,31 @@ import type { DownloadTask, Episode, Vod } from './types'
  */
 const CACHE_NAME = 'zy-media-v1'
 const SEGMENT_CONCURRENCY = 4
+/** 原生同时下 2 集：再多会摊薄单集速度。 */
+const MAX_PARALLEL_EPISODES = 2
+const MAX_RETRY = 3
 
 type Listener = () => void
 const listeners = new Set<Listener>()
 const active = new Map<string, AbortController>()
 const paused = new Set<string>()
+/** 仅 Wi-Fi 下被挡住的任务：留在队列里等网络恢复，而不是直接置为已暂停。 */
+const waitingWifi = new Set<string>()
+let runningEpisodes = 0
 
 function emit() {
   listeners.forEach((fn) => fn())
 }
+
+/** 回到 Wi-Fi 后自动把等待中的任务放回队列。 */
+;(navigator as unknown as { connection?: EventTarget }).connection?.addEventListener?.('change', () => {
+  if (onCellular() || waitingWifi.size === 0) return
+  waitingWifi.forEach((id) => {
+    void db.downloads.update(id, { error: undefined, updatedAt: Date.now() })
+  })
+  waitingWifi.clear()
+  void runQueue()
+})
 
 export function subscribeDownloads(fn: Listener): () => void {
   listeners.add(fn)
@@ -52,8 +69,10 @@ function onCellular(): boolean {
   return conn.effectiveType === '2g' || conn.effectiveType === '3g'
 }
 
-/** 单集空间预估：网页端无法预知码率，按 300MB 一集留余量。 */
-const ESTIMATED_EPISODE_BYTES = 700 * 1024 * 1024
+/** 与原生 DetailViewModel 一致：单集预留 350MB。 */
+const ESTIMATED_EPISODE_BYTES = 350 * 1024 * 1024
+/** 原生 LOW_SPACE_BYTES = 1GB：低于这个值直接拦，低于需求 0.8 倍只提醒。 */
+const LOW_SPACE_BYTES = 1024 * 1024 * 1024
 
 export async function spaceWarning(count: number): Promise<string | null> {
   if (!navigator.storage?.estimate) return null
@@ -61,8 +80,11 @@ export async function spaceWarning(count: number): Promise<string | null> {
     const { quota = 0, usage = 0 } = await navigator.storage.estimate()
     const free = Math.max(0, quota - usage)
     const need = ESTIMATED_EPISODE_BYTES * count
-    if (free < need) {
-      return `浏览器可用空间不足（剩余约 ${sizeText(free)}，需要约 ${sizeText(need)}），请清理后再试`
+    if (free < LOW_SPACE_BYTES) {
+      return '剩余空间不足 1GB，下载可能失败，请先清理浏览器缓存'
+    }
+    if (free < need * 0.8) {
+      return `预计需要 ${sizeText(need)}，当前剩余 ${sizeText(free)}，空间可能不足，请留意`
     }
   } catch {
     /* 估算失败就不拦 */
@@ -98,6 +120,9 @@ export async function enqueue(
       doneSegments: 0,
       totalSegments: 0,
       bytes: 0,
+      speedBytesPerSecond: 0,
+      attempts: 0,
+      rebuilt: false,
       segmentUrls: [],
       createdAt: now,
       updatedAt: now,
@@ -105,22 +130,47 @@ export async function enqueue(
     await db.downloads.put(task)
   }
   emit()
-  runQueue()
+  void runQueue()
 }
 
 let pumping = false
 
+/** 最多同时跑 2 集；领任务时先把状态写成 downloading，避免并发重复领同一个。 */
 async function runQueue() {
   if (pumping) return
   pumping = true
   try {
-    while (true) {
-      const next = await db.downloads.where('state').equals('queued').first()
+    while (runningEpisodes < MAX_PARALLEL_EPISODES) {
+      const queued = await db.downloads.where('state').equals('queued').toArray()
+      const next = queued.find((t) => !waitingWifi.has(t.id))
       if (!next) break
-      await downloadOne(next.id)
+      if (paused.has(next.id)) {
+        await patch(next.id, { state: 'paused' })
+        continue
+      }
+      await db.downloads.update(next.id, { state: 'downloading', updatedAt: Date.now() })
+      runningEpisodes++
+      void downloadOne(next.id).finally(() => {
+        runningEpisodes--
+        void runQueue()
+      })
     }
   } finally {
     pumping = false
+  }
+}
+
+/** 地址带时效签名：失败时用最新详情重新解析这一集，每集最多重建一次。 */
+async function rebuildDownloadUrl(task: DownloadTask): Promise<string | null> {
+  try {
+    const detail = await fetchDetail(task.vodId, true)
+    const sources = parsePlaySources(detail.playFrom, detail.playUrls)
+    const source = sources[task.sourceIndex]
+    const episode = source?.episodes[task.episodeIndex]
+    if (!source || source.webOnly || !episode) return null
+    return episode.url === task.url ? null : episode.url
+  } catch {
+    return null
   }
 }
 
@@ -130,9 +180,12 @@ async function downloadOne(id: string) {
   if (!task || task.state === 'completed') return
   const settings = getSettings()
   if (settings.wifiOnly && onCellular()) {
-    await patch(id, { state: 'paused', error: '仅 Wi-Fi 下载已开启，当前为移动网络' })
+    // 留在队列里等 Wi-Fi，而不是直接暂停——对齐原生「非 Wi-Fi 下排队等待」
+    waitingWifi.add(id)
+    await patch(id, { state: 'queued', error: '等待 Wi-Fi 网络' })
     return
   }
+  waitingWifi.delete(id)
 
   const controller = new AbortController()
   active.set(id, controller)
@@ -187,6 +240,8 @@ async function downloadOne(id: string) {
 
     let done = 0
     let bytes = task.bytes
+    let lastBytes = bytes
+    let lastAt = Date.now()
     const queue = [...segments]
     const failure: { error: Error | null } = { error: null }
 
@@ -215,9 +270,18 @@ async function downloadOne(id: string) {
         )
         bytes += buf.byteLength
         done++
+        const now = Date.now()
+        const elapsed = (now - lastAt) / 1000
+        const speed =
+          elapsed >= 0.5 ? Math.round((bytes - lastBytes) / elapsed) : task.speedBytesPerSecond ?? 0
+        if (elapsed >= 0.5) {
+          lastBytes = bytes
+          lastAt = now
+        }
         await patch(id, {
           doneSegments: done,
           bytes,
+          speedBytesPerSecond: speed,
           progress: Math.min(0.99, done / segments.length),
         })
       }
@@ -228,14 +292,47 @@ async function downloadOne(id: string) {
     })
     if (failure.error) throw failure.error
 
-    await patch(id, { state: 'completed', progress: 1, doneSegments: segments.length, error: undefined })
+    await patch(id, {
+      state: 'completed',
+      progress: 1,
+      doneSegments: segments.length,
+      speedBytesPerSecond: 0,
+      error: undefined,
+    })
     // 让浏览器尽量别把刚下的东西清掉
     navigator.storage?.persist?.().catch(() => undefined)
   } catch (e) {
     if (paused.has(id) || (e as Error).name === 'AbortError') {
       await patch(id, { state: 'paused' })
     } else {
-      await patch(id, { state: 'failed', error: (e as Error).message || '下载失败' })
+      const attempts = (task.attempts ?? 0) + 1
+      let rebuilt = task.rebuilt ?? false
+      let url = task.url
+      // 第一次失败先尝试重建过期地址，之后按次数重试
+      if (!rebuilt && attempts <= MAX_RETRY) {
+        const fresh = await rebuildDownloadUrl(task)
+        if (fresh) {
+          url = fresh
+          rebuilt = true
+        }
+      }
+      if (attempts <= MAX_RETRY) {
+        await patch(id, {
+          state: 'queued',
+          attempts,
+          rebuilt,
+          url,
+          segmentUrls: [],
+          bytes: 0,
+          doneSegments: 0,
+          progress: 0,
+          speedBytesPerSecond: 0,
+          error: `下载失败，正在重试（${attempts - 1}/${MAX_RETRY}）`,
+        })
+        window.setTimeout(() => void runQueue(), 1500 * attempts)
+      } else {
+        await patch(id, { state: 'failed', attempts, error: (e as Error).message || '下载失败' })
+      }
     }
   } finally {
     active.delete(id)
@@ -251,12 +348,38 @@ export async function pause(id: string) {
 
 export async function resume(id: string) {
   paused.delete(id)
+  waitingWifi.delete(id)
   await patch(id, { state: 'queued', error: undefined })
-  runQueue()
+  void runQueue()
+}
+
+/** 失败后手动重试：次数归零，重新排队。 */
+export async function retryDownload(id: string) {
+  paused.delete(id)
+  waitingWifi.delete(id)
+  await patch(id, {
+    state: 'queued',
+    attempts: 0,
+    error: undefined,
+    progress: 0,
+    doneSegments: 0,
+    bytes: 0,
+    speedBytesPerSecond: 0,
+  })
+  void runQueue()
+}
+
+export async function pauseAll(ids: string[]) {
+  for (const id of ids) await pause(id)
+}
+
+export async function resumeAll(ids: string[]) {
+  for (const id of ids) await resume(id)
 }
 
 export async function remove(id: string) {
   paused.add(id)
+  waitingWifi.delete(id)
   active.get(id)?.abort()
   const task = await db.downloads.get(id)
   if (task && 'caches' in window) {
@@ -270,6 +393,12 @@ export async function remove(id: string) {
 export async function clearCompleted(): Promise<void> {
   const done = await db.downloads.where('state').equals('completed').toArray()
   for (const task of done) await remove(task.id)
+}
+
+/** 对应原生「清空全部下载」：连未完成的任务一起清掉。 */
+export async function clearAllDownloads(): Promise<void> {
+  const all = await db.downloads.toArray()
+  for (const task of all) await remove(task.id)
 }
 
 export async function isEpisodeDownloaded(url: string): Promise<boolean> {

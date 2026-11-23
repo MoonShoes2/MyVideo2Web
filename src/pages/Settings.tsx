@@ -5,15 +5,24 @@ import { clearPageCache } from '../lib/repo'
 import {
   CACHE_CAPACITY_OPTIONS,
   DEFAULT_BASE_URL,
-  SPEED_OPTIONS,
+  SETTINGS_SPEED_OPTIONS,
+  displayApiUrl,
   normalizeBaseUrl,
   updateSettings,
   useSettings,
 } from '../lib/settings'
-import { formatSpeed } from '../lib/parse'
+/** 设置页沿用原生的 1.0x / 1.25x 写法（播放器里才是 1× / 1.25×）。 */
+const settingSpeedLabel = (value: number) => `${Number.isInteger(value) ? value.toFixed(1) : value.toFixed(2)}x`
 import { Icon } from '../components/icons'
 import { ScreenTopBar, Segmented, Switch } from '../components/common'
 import { PageShell, useGoBack } from '../App'
+
+/** 原生 SettingsScreen.kt 的三个预设采集源，顺序与文案一致。 */
+const API_SOURCE_OPTIONS = [
+  { label: 'lzizy.net', note: '⭐ 首选 · 列表/搜索最快', url: 'https://lzizy.net/api.php/provide/vod/' },
+  { label: 'www.lzizy.net', note: '等价备用', url: 'https://www.lzizy.net/api.php/provide/vod/' },
+  { label: 'lzizy.com', note: '⚠️ 较慢、偶发超时 · 末位备用', url: 'https://lzizy.com/api.php/provide/vod/' },
+]
 
 const THEME_OPTIONS = [
   { label: '跟随系统', value: 0 },
@@ -27,7 +36,7 @@ export default function Settings() {
   const settings = useSettings()
   const [speedOpen, setSpeedOpen] = useState(false)
   const [urlOpen, setUrlOpen] = useState(false)
-  const [urlInput, setUrlInput] = useState(settings.baseUrl)
+  const [urlInput, setUrlInput] = useState(displayApiUrl(settings.baseUrl))
   const [pinging, setPinging] = useState(false)
   const [pingResult, setPingResult] = useState<string | null>(null)
 
@@ -81,16 +90,16 @@ export default function Settings() {
             }
           />
           <Row
-            title="播放页亮度手势"
-            subtitle="左半屏上下滑调节画面亮度；浏览器内用遮罩实现，不改系统背光"
-            trailing={<span className="text-label-lg text-muted">已支持</span>}
+            title="亮度还原权限"
+            subtitle="浏览器无法修改系统亮度；播放页的左半屏手势改用画面遮罩实现"
+            trailing={<span className="text-label-lg text-muted">浏览器限制</span>}
           />
           <Row
             title="默认倍速"
             onClick={() => setSpeedOpen(true)}
             trailing={
               <>
-                <span className="text-label-lg text-muted">{formatSpeed(settings.defaultSpeed)}x</span>
+                <span className="text-label-lg text-muted">{settingSpeedLabel(settings.defaultSpeed)}</span>
                 <Chevron />
               </>
             }
@@ -118,9 +127,9 @@ export default function Settings() {
         <Group title="接口">
           <Row
             title="接口地址"
-            subtitle={settings.baseUrl}
+            subtitle={displayApiUrl(settings.baseUrl)}
             onClick={() => {
-              setUrlInput(settings.baseUrl)
+              setUrlInput(displayApiUrl(settings.baseUrl))
               setPingResult(null)
               setUrlOpen(true)
             }}
@@ -154,7 +163,7 @@ export default function Settings() {
         <Group title="关于">
           <Row
             title="版本号"
-            trailing={<span className="text-label-md text-muted">1.0.0 · Web</span>}
+            trailing={<span className="text-label-md text-muted">1.2.0</span>}
           />
           <p className="px-4 py-3 text-label-sm text-muted">
             数据来源：第三方采集接口，本应用不存储任何视频文件，所有内容版权归原站点与权利人所有。
@@ -166,7 +175,7 @@ export default function Settings() {
 
       {speedOpen && (
         <Dialog onClose={() => setSpeedOpen(false)} title="默认倍速">
-          {SPEED_OPTIONS.map((value) => (
+          {SETTINGS_SPEED_OPTIONS.map((value) => (
             <button
               key={value}
               onClick={() => {
@@ -184,9 +193,17 @@ export default function Settings() {
                   <span className="h-2 w-2 rounded-full bg-brand" />
                 )}
               </span>
-              <span className="text-body-lg text-ink">{formatSpeed(value)}x</span>
+              <span className="text-body-lg text-ink">{settingSpeedLabel(value)}</span>
             </button>
           ))}
+          <div className="mt-2 flex justify-end">
+            <button
+              onClick={() => setSpeedOpen(false)}
+              className="tap rounded-lg px-3 py-2 text-label-lg text-brand"
+            >
+              关闭
+            </button>
+          </div>
         </Dialog>
       )}
 
@@ -198,7 +215,24 @@ export default function Settings() {
             placeholder={DEFAULT_BASE_URL}
             className="w-full rounded-lg border border-divider bg-bg px-3 py-2 text-body-md text-ink outline-none focus:border-brand"
           />
-          <p className="mt-2 text-label-sm text-muted">换域名时在此修改，无需重新部署。</p>
+          <div className="mt-2 overflow-hidden rounded-lg bg-bg">
+            {API_SOURCE_OPTIONS.map((source) => (
+              <button
+                key={source.label}
+                onClick={() => {
+                  setUrlInput(source.url)
+                  setPingResult(null)
+                }}
+                className="tap block w-full border-b border-divider px-3 py-2 text-left last:border-0"
+              >
+                <p className="text-body-md text-ink">{source.label}</p>
+                <p className="text-label-sm text-muted">{source.note}</p>
+              </button>
+            ))}
+          </div>
+          <p className="mt-2 text-label-sm text-muted">
+            可点右侧箭头选择预设源，也可直接手动输入；换域名无需更新 App。
+          </p>
           <div className="mt-3 flex items-center gap-2">
             <button onClick={() => doPing(urlInput)} disabled={pinging} className="tap px-1 py-1 text-label-lg text-brand">
               {pinging ? '测试中…' : '测试连接'}

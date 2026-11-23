@@ -11,6 +11,7 @@
  */
 import express from 'express'
 import dns from 'node:dns/promises'
+import https from 'node:https'
 import net from 'node:net'
 import path from 'node:path'
 import fs from 'node:fs'
@@ -24,7 +25,7 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/126.0.0.0 Safari/537.36'
 
-const DEFAULT_BASE = 'https://cj.lziapi.com/'
+const DEFAULT_BASE = 'https://lzizy.net/'
 const API_PATH = 'api.php/provide/vod/'
 
 const app = express()
@@ -35,6 +36,8 @@ function normalizeBase(raw) {
   let url = String(raw || '').trim()
   if (!url) return DEFAULT_BASE
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url
+  const index = url.indexOf('api.php')
+  if (index > 0) url = url.slice(0, index)
   if (!url.endsWith('/')) url += '/'
   return url
 }
@@ -83,17 +86,88 @@ async function assertPublicUrl(raw) {
   return u
 }
 
+/**
+ * DNS 兜底：系统解析失败时改走阿里 DoH（对应原生 DohDns.kt）。
+ * 拿到 A 记录后用自定义 lookup 走 IP 连接，但保留原 hostname 做 SNI/Host。
+ */
+const DOH_ENDPOINTS = ['dns.alidns.com', '1.12.12.12']
+
+async function resolveViaDoh(host) {
+  for (const endpoint of DOH_ENDPOINTS) {
+    try {
+      const url = `https://${endpoint}/resolve?name=${encodeURIComponent(host)}&type=A`
+      const res = await fetch(url, {
+        headers: { Accept: 'application/dns-json' },
+        signal: AbortSignal.timeout(5000),
+      })
+      if (!res.ok) continue
+      const json = await res.json()
+      const answer = (json.Answer ?? []).find((a) => (a.type === 1 || a.type === 28) && a.data)
+      if (answer?.data) return answer.data
+    } catch {
+      /* 换下一个 DoH 端点 */
+    }
+  }
+  return null
+}
+
+function httpsToIp(urlString, ip, headers, redirects = 0) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(urlString)
+    const req = https.request(
+      {
+        protocol: 'https:',
+        hostname: u.hostname,
+        port: u.port || 443,
+        path: u.pathname + u.search,
+        method: 'GET',
+        headers: { ...headers, Host: u.host },
+        lookup: (_host, _options, callback) => callback(null, ip, 4),
+      },
+      (res) => {
+        const status = res.statusCode ?? 502
+        if (status >= 300 && status < 400 && res.headers.location && redirects < 5) {
+          res.resume()
+          const next = new URL(res.headers.location, u).href
+          resolve(httpsToIp(next, ip, headers, redirects + 1))
+          return
+        }
+        const chunks = []
+        res.on('data', (chunk) => chunks.push(chunk))
+        res.on('end', () =>
+          resolve(new Response(Buffer.concat(chunks), { status, headers: res.headers })),
+        )
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
 async function upstream(url, { range, referer, accept } = {}) {
   const u = await assertPublicUrl(url)
   const headers = { 'User-Agent': USER_AGENT, Accept: accept || '*/*' }
   if (referer) headers.Referer = referer
   if (range) headers.Range = range
-  const res = await fetch(u, {
+
+  if (!net.isIP(u.hostname)) {
+    let systemDnsOk = true
+    try {
+      await dns.lookup(u.hostname)
+    } catch {
+      systemDnsOk = false
+    }
+    if (!systemDnsOk) {
+      const ip = await resolveViaDoh(u.hostname)
+      if (ip) return await httpsToIp(u.href, ip, headers)
+    }
+  }
+
+  return await fetch(u, {
     headers,
     redirect: 'follow',
     signal: AbortSignal.timeout(30000),
   })
-  return res
 }
 
 function fail(res, err, status = 502) {

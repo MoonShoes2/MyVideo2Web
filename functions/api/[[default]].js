@@ -17,7 +17,7 @@ const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
   'Chrome/126.0.0.0 Safari/537.36'
 
-const DEFAULT_BASE = 'https://cj.lziapi.com/'
+const DEFAULT_BASE = 'https://lzizy.net/'
 const API_PATH = 'api.php/provide/vod/'
 
 // ─────────────────────────── 基础工具 ───────────────────────────
@@ -26,6 +26,8 @@ function normalizeBase(raw) {
   let url = String(raw || '').trim()
   if (!url) return DEFAULT_BASE
   if (!/^https?:\/\//i.test(url)) url = 'https://' + url
+  const index = url.indexOf('api.php')
+  if (index > 0) url = url.slice(0, index)
   if (!url.endsWith('/')) url += '/'
   return url
 }

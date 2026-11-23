@@ -1,4 +1,4 @@
-import { getSettings, normalizeBaseUrl } from './settings'
+import { getSettings, normalizeBaseUrl, VOD_API_PATH } from './settings'
 import type { VodResponse } from './types'
 
 /** 业务失败（接口不可达、返回结构异常），message 直接给用户看。 */
@@ -12,7 +12,23 @@ export class ApiException extends Error {
   }
 }
 
-export const API_PATH = 'api.php/provide/vod/'
+export const API_PATH = VOD_API_PATH
+
+/** 代理层失败时返回的是 JSON，别把 `{"error":"fetch failed"}` 原样给用户看。 */
+function friendlyProxyError(detail: string): string {
+  const text = detail.trim()
+  if (!text) return ''
+  try {
+    const parsed = JSON.parse(text) as { error?: string }
+    const message = String(parsed.error || '')
+    if (/fetch failed|timeout|ENOTFOUND|EAI_AGAIN/i.test(message)) {
+      return '网络连接失败，请检查网络或稍后重试'
+    }
+    return message ? `数据源连接失败：${message}` : ''
+  } catch {
+    return text.slice(0, 120)
+  }
+}
 
 function baseParam(base?: string): string {
   return encodeURIComponent(normalizeBaseUrl(base ?? getSettings().baseUrl))
@@ -47,7 +63,7 @@ export async function requestRaw(
     const res = await fetch(url)
     if (!res.ok) {
       const detail = await res.text().catch(() => '')
-      throw new ApiException(detail.slice(0, 120) || `接口返回 HTTP ${res.status}`)
+      throw new ApiException(friendlyProxyError(detail) || `接口返回 HTTP ${res.status}`)
     }
     body = await res.text()
   } catch (e) {
