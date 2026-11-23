@@ -30,14 +30,6 @@ export interface Settings {
   skipAds: boolean
   wifiOnly: boolean
   cacheCapacityGb: number
-  /**
-   * 播放横屏片源时是否自动转横屏。
-   *
-   * 浏览器标签页里它是安全的（lock 常被拒），但装成 PWA 后窗口本身全屏，
-   * 转屏会真的生效并引起渲染表面重建，个别机型上会把起播卡死。
-   * 所以安装态默认关闭，用户可以自己打开。
-   */
-  autoRotate: boolean
 }
 
 const KEY_BASE_URL = 'zy.baseUrl'
@@ -47,7 +39,6 @@ const KEY_SPEED = 'zy.defaultSpeed'
 const KEY_SKIP_ADS = 'zy.skipAds'
 const KEY_WIFI_ONLY = 'zy.wifiOnly'
 const KEY_CACHE_GB = 'zy.cacheGb'
-const KEY_AUTO_ROTATE = 'zy.autoRotate'
 
 /** 设置页「默认倍速」：原生只到 2.0x（SettingsScreen.kt:62-69）。 */
 export const SETTINGS_SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2]
@@ -76,20 +67,6 @@ function readNum(key: string, fallback: number): number {
   return Number.isFinite(n) ? n : fallback
 }
 
-/** 是否以「已安装应用」运行：决定默认值（安装态默认不自动转屏，避免卡住起播）。 */
-function installedEnv(): boolean {
-  try {
-    return (
-      window.matchMedia('(display-mode: fullscreen)').matches ||
-      window.matchMedia('(display-mode: standalone)').matches ||
-      window.matchMedia('(display-mode: minimal-ui)').matches ||
-      (navigator as unknown as { standalone?: boolean }).standalone === true
-    )
-  } catch {
-    return false
-  }
-}
-
 function load(): Settings {
   return {
     baseUrl: normalizeBaseUrl(localStorage.getItem(KEY_BASE_URL) || DEFAULT_BASE_URL),
@@ -99,7 +76,6 @@ function load(): Settings {
     skipAds: readBool(KEY_SKIP_ADS, true),
     wifiOnly: readBool(KEY_WIFI_ONLY, true),
     cacheCapacityGb: readNum(KEY_CACHE_GB, DEFAULT_CACHE_GB),
-    autoRotate: readBool(KEY_AUTO_ROTATE, !installedEnv()),
   }
 }
 
@@ -123,7 +99,6 @@ export function updateSettings(patch: Partial<Settings>) {
   if (patch.skipAds != null) localStorage.setItem(KEY_SKIP_ADS, patch.skipAds ? '1' : '0')
   if (patch.wifiOnly != null) localStorage.setItem(KEY_WIFI_ONLY, patch.wifiOnly ? '1' : '0')
   if (patch.cacheCapacityGb != null) localStorage.setItem(KEY_CACHE_GB, String(patch.cacheCapacityGb))
-  if (patch.autoRotate != null) localStorage.setItem(KEY_AUTO_ROTATE, patch.autoRotate ? '1' : '0')
   emit()
 }
 

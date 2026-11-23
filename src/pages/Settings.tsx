@@ -95,16 +95,6 @@ export default function Settings() {
             trailing={<span className="text-label-lg text-muted">浏览器限制</span>}
           />
           <Row
-            title="自动横屏"
-            subtitle="横屏片源播放时自动转成横屏。安装版若出现起播卡住，关掉它"
-            trailing={
-              <Switch
-                checked={settings.autoRotate}
-                onChange={(v) => updateSettings({ autoRotate: v })}
-              />
-            }
-          />
-          <Row
             title="默认倍速"
             onClick={() => setSpeedOpen(true)}
             trailing={

@@ -19,7 +19,7 @@ import {
 } from '../lib/parse'
 import { offlineVod } from '../lib/downloads'
 import { resolveAdRanges, inRange, type AdRange } from '../lib/ads'
-import { getSettings, PLAYER_SPEED_OPTIONS, updateSettings, useSettings } from '../lib/settings'
+import { getSettings, PLAYER_SPEED_OPTIONS, useSettings } from '../lib/settings'
 import { BUILD_TAG, hardReload } from '../lib/version'
 import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
@@ -178,44 +178,22 @@ export default function Player() {
   // 安装态窗口本身就是全屏，任何额外的 requestFullscreen / orientation.lock
   // 都会引起窗口尺寸变化，正是 PWA 独有的那部分差异。
   const installedPwa = isInstalledPwa()
-  // 自动横屏开关的最新值：hls 回调里读 ref，避免因为设置变化重建播放器
-  const autoRotateRef = useRef(settings.autoRotate)
-  autoRotateRef.current = settings.autoRotate
-  // 安装态下「等首帧再转」的待办标记
-  const pendingRotateRef = useRef(false)
-  // 是否真正进入过全屏：比 videoPortrait 更可靠的「横屏播放中」信号，
-  // 拿不到视频宽高时也能正确识别系统返回键退出全屏。
+  // 是否真正进入过全屏（只有浏览器标签页会用到）
   const wasFullscreenRef = useRef(false)
+  // 用户主动切回竖屏时置位：避免 fullscreenchange 把「退出全屏」误判成系统返回
+  const manualUnlockRef = useRef(false)
   // 主动离开标记：顶栏返回 / 组件卸载时我们主动退出全屏，
   // fullscreenchange 会因此再触发一次，用这个标记避免重复 navigate。
   const leavingRef = useRef(false)
+  // 当前是否横屏：只用于决定按钮文案（旋转 / 竖屏）和切换方向
+  const [landscapeView, setLandscapeView] = useState(false)
+  useEffect(() => {
+    const sync = () => setLandscapeView((screen.orientation?.type ?? '').startsWith('landscape'))
+    sync()
+    screen.orientation?.addEventListener?.('change', sync)
+    return () => screen.orientation?.removeEventListener?.('change', sync)
+  }, [])
 
-  /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
-  const enterLandscape = useCallback(async () => {
-    if (!autoRotateRef.current) return
-    // 安装态：窗口本身已全屏，lock 会真的生效并引起窗口尺寸变化，
-    // 转屏瞬间正好在灌首片会把首帧卡死。所以只记下来，等首帧稳定后再转。
-    if (installedPwa) {
-      pendingRotateRef.current = true
-      return
-    }
-    const el = stageRef.current
-    // 「网页正常、装成 PWA 就不对」的根源就在这段：
-    // 浏览器标签页里 requestFullscreen 会被拒绝，orientation.lock 跟着失败，
-    // 结果 = 什么都没发生，所以播放正常；
-    // 而安装成 PWA 后窗口本身已经全屏，lock 会**真的生效**，把窗口转成横屏。
-    // 转屏会引起窗口尺寸变化，Android 随之重建 video 的渲染表面，
-    // 正在灌数据的首帧就再也出不来——表现就是「进度条出来了、圈一直转」。
-    // PWA 的 manifest 已经是 orientation: any，用户把手机横过来系统自己会转，
-    // 完全不需要我们插手。所以安装态一律不转，行为与浏览器标签页一致。
-    try {
-      if (el && !document.fullscreenElement) await el.requestFullscreen()
-      wasFullscreenRef.current = true
-      await screen.orientation?.lock?.('landscape')
-    } catch {
-      /* 桌面端没有 lock；非用户手势内请求全屏会被拒 */
-    }
-  }, [installedPwa])
   const hlsRef = useRef<Hls | null>(null)
   const tailAdHandledRef = useRef(false)
   const positionRef = useRef(0)
@@ -237,6 +215,46 @@ export default function Player() {
     if (toastTimer.current) window.clearTimeout(toastTimer.current)
     toastTimer.current = window.setTimeout(() => setToast(null), 2000)
   }, [])
+
+  /**
+   * 手动转屏：横屏 ↔ 竖屏。
+   *
+   * 原来是「横屏片源自动转」，但装成 PWA 后窗口本身就是全屏，转屏会让整个窗口
+   * 重新布局、Android 随之重建 video 的渲染表面；在灌首片的瞬间做这件事会把首帧
+   * 卡死（浏览器标签页里没这个毛病，因为那时 requestFullscreen 常常直接被拒）。
+   * 所以改成完全手动：转不转、什么时候转，由用户决定。
+   */
+  const toggleOrientation = useCallback(async () => {
+    const el = stageRef.current
+    try {
+      if (landscapeView) {
+        manualUnlockRef.current = true
+        try {
+          screen.orientation?.unlock?.()
+        } catch {
+          /* 没有锁定过时 unlock 会抛，忽略 */
+        }
+        if (!installedPwa && document.fullscreenElement) {
+          await document.exitFullscreen().catch(() => undefined)
+        }
+        showToast('已切回竖屏')
+        return
+      }
+      // 浏览器标签页里要先进元素全屏，锁方向才有意义；PWA 窗口本身已全屏
+      if (!installedPwa && el && !document.fullscreenElement) {
+        await el.requestFullscreen()
+        wasFullscreenRef.current = true
+      }
+      manualUnlockRef.current = false
+      if (!screen.orientation?.lock) {
+        showToast('请把手机横过来')
+        return
+      }
+      await screen.orientation.lock('landscape')
+    } catch {
+      showToast('这个环境不支持自动旋转，请把手机横过来')
+    }
+  }, [landscapeView, installedPwa, showToast])
 
   // ── 初始加载：最新的直链 → 下载索引 → 详情缓存，三级兜底 ──
   useEffect(() => {
@@ -344,9 +362,6 @@ export default function Player() {
         const portrait = video.videoHeight >= video.videoWidth
         setVideoPortrait(portrait)
         rememberOrientation(vodId, portrait)
-        // 每次进页都按实测方向转一次：若记忆值与实测相同，state 不会变、effect 不重跑，
-        // 所以在这里直接触发，保证「返回再进」同样自动旋转。
-        if (!portrait) enterLandscape().catch(() => undefined)
       }
       if (startAt > 0 && Math.abs(video.currentTime - startAt) > 1) video.currentTime = startAt
       video.playbackRate = speed
@@ -366,13 +381,6 @@ export default function Player() {
       if (cancelled) return
       if (video.readyState >= 2 || video.currentTime > 0) return
       if (Date.now() - lastProgress > STARTUP_STALL_MS) {
-        // 一直起不来时，如果开过自动横屏就先把它关掉——转屏重建渲染表面
-        // 是安装态下最可疑的卡点，关掉后下次进入即可排除这个变量。
-        if (installedPwa && autoRotateRef.current) {
-          pendingRotateRef.current = false
-          updateSettings({ autoRotate: false })
-          showToast('起播超时，已关闭自动横屏，可在设置里重新打开')
-        }
         setPlaybackError('播放超时，地址可能已失效，试试切换线路')
       }
     }, 1000)
@@ -782,14 +790,6 @@ export default function Player() {
     }
   }
 
-  // 横屏片源自动转横屏（对齐原版 SCREEN_ORIENTATION_SENSOR_LANDSCAPE）
-  // 必须等 loading 结束、stage 挂载后再请求：有方向记忆时 videoPortrait 初值就是 false，
-  // 若在 loading 阶段触发，stageRef 还是 null，requestFullscreen 直接失败且之后再不触发。
-  useEffect(() => {
-    if (loading || !vod) return
-    if (videoPortrait === false) enterLandscape().catch(() => undefined)
-  }, [loading, vod, videoPortrait, enterLandscape])
-
   // StrictMode 开发模式会 mount→unmount→remount；每次挂载都重置主动离开标记，
   // 否则第一次 unmount 置的 true 会残留到 remount，导致返回按钮/自动返回全部失效。
   useEffect(() => {
@@ -809,7 +809,7 @@ export default function Player() {
     const onFsChange = () => {
       // 安装态窗口本身就在全屏里，它的 fullscreenchange 不代表用户按了返回，
       // 不能据此退出播放页（否则转屏一次就把人踢回详情页）。
-      if (installedPwa) return
+      if (installedPwa || manualUnlockRef.current) return
       if (document.fullscreenElement) {
         // 进入全屏（横屏片源自动转的），记下来；系统返回键退出时据此判断
         wasFullscreenRef.current = true
@@ -828,20 +828,6 @@ export default function Player() {
     return () => document.removeEventListener('fullscreenchange', onFsChange)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leavePlayer, videoPortrait, vod, loading, installedPwa])
-
-  // 安装态：首帧渲染出来之后再延迟转横屏。
-  // 转屏会让 Android 重建 video 的渲染表面，紧贴起播做会把首帧卡死；
-  // 等画面稳住几百毫秒再转，用户几乎无感，也不会打断解码。
-  useEffect(() => {
-    if (!installedPwa || !firstFrame || !pendingRotateRef.current) return
-    const timer = window.setTimeout(() => {
-      if (!pendingRotateRef.current) return
-      pendingRotateRef.current = false
-      const p = screen.orientation?.lock?.('landscape')
-      if (p && typeof p.catch === 'function') p.catch(() => undefined)
-    }, 900)
-    return () => window.clearTimeout(timer)
-  }, [installedPwa, firstFrame])
 
   // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
   useEffect(() => {
@@ -1248,8 +1234,6 @@ export default function Player() {
         <button
           onClick={() => {
             setNeedsTap(false)
-            // 这是全页唯一带用户手势的时刻：横屏片源在这里转横屏全屏成功率最高
-            if (videoPortrait === false) enterLandscape().catch(() => undefined)
             videoRef.current?.play().catch(() => setNeedsTap(true))
           }}
           className="tap absolute inset-0 z-10 flex items-center justify-center"
@@ -1330,6 +1314,8 @@ export default function Player() {
                 onNext={() => nextEpisode()}
                 onSpeed={() => setSpeedMenuOpen((v) => !v)}
                 onPlaylist={() => setPanelOpen(true)}
+                onRotate={() => void toggleOrientation()}
+                landscape={landscapeView}
               />
             </div>
           )}
@@ -1441,6 +1427,8 @@ function PlayerBottomBar({
   onNext,
   onSpeed,
   onPlaylist,
+  onRotate,
+  landscape,
 }: {
   positionMs: number
   durationMs: number
@@ -1453,6 +1441,8 @@ function PlayerBottomBar({
   onNext: () => void
   onSpeed: () => void
   onPlaylist: () => void
+  onRotate: () => void
+  landscape: boolean
 }) {
   return (
     <div className="bg-gradient-to-t from-black/80 to-transparent px-3.5 pt-5 pb-2.5 text-white">
@@ -1480,6 +1470,13 @@ function PlayerBottomBar({
         </button>
         <div className="w-2" />
         <ControlIcon name="playlist" label="选集" onClick={onPlaylist} />
+        <button
+          onClick={onRotate}
+          className="tap ml-1 rounded-md bg-white/15 px-2 py-1 text-label-md"
+          aria-label={landscape ? '切回竖屏' : '横屏播放'}
+        >
+          {landscape ? '竖屏' : '旋转'}
+        </button>
       </div>
     </div>
   )
