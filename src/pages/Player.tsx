@@ -342,68 +342,99 @@ export default function Player() {
       const hls = new Hls({
         maxBufferLength: 30,
         backBufferLength: 30,
-        // 加载超时/重试上限：分片或播放列表卡住时到点报 fatal，
-        // 交给下面的错误浮层（重试 / 换线路），而不是一直转圈。
-        manifestLoadingTimeOut: 15000,
-        levelLoadingTimeOut: 15000,
-        fragLoadingTimeOut: 25000,
-        manifestLoadingMaxRetry: 2,
-        levelLoadingMaxRetry: 2,
-        fragLoadingMaxRetry: 3,
+        // 各段超时压到 8 秒：一条路线挂了要能尽快换另一条，
+        // 而不是让用户对着转圈等 15 秒才发现走不通。
+        manifestLoadingTimeOut: 8000,
+        levelLoadingTimeOut: 8000,
+        fragLoadingTimeOut: 12000,
+        manifestLoadingMaxRetry: 0,
+        levelLoadingMaxRetry: 0,
+        fragLoadingMaxRetry: 1,
       })
       hlsRef.current = hls
-      // 直连优先：Cloudflare 边缘节点回源国内 CDN 经常几十秒甚至超时，
-      // 而手机直连 CDN 是几百毫秒（且源站返回 ACAO: *）。直连失败（CORS/防盗链/网络）
-      // 再自动回退同源代理。已下载的集必须走代理，否则命中不了离线缓存。
+      // 两条取流路线：
+      //   直连 —— 手机直连 CDN，几百毫秒，但不一定通（被墙/CORS/防盗链）
+      //   代理 —— 同源 /api/hls，绕开跨域，但 Cloudflare 边缘回源国内 CDN 经常挂住
+      // 谁都不保证可用，所以做成阶梯：探测定首条，挂了就换另一条，两条都挂再重试一轮。
+      // 已下载的集必须走代理，否则命中不了离线缓存。
       const directUrl = toPlayableUrl(url)
       const proxyUrl = hlsUrl(url)
       const offlineEpisode = downloadedRef.current[sourceIndex]?.includes(episodeIndex) ?? false
       // https 页面里请求 http 源属于混合内容，会被浏览器直接拦掉
       const canDirect = /^https:/i.test(directUrl) && !offlineEpisode
-      let usingDirect = canDirect
+      const routes = canDirect ? [directUrl, proxyUrl] : [proxyUrl]
+      let routeIdx = 0
+      // 每条路线各自记失败次数，换路线时优先挑「还没失败过」的那条
+      const routeFails: number[] = routes.map(() => 0)
+      let retryRounds = 0
+      let networkRetries = 0
+      let mediaRetries = 0
+
+      const loadRoute = () => {
+        const target = routes[routeIdx]
+        const isDirect = target === directUrl
+        bumpProgress()
+        markStage(isDirect ? '直连' : '代理')
+        hls.loadSource(target)
+      }
+
+      /** 找一条不是当前、且还没失败过的路线。 */
+      const nextRoute = (): number => {
+        for (let i = 0; i < routes.length; i += 1) {
+          if (i !== routeIdx && routeFails[i] === 0) return i
+        }
+        return -1
+      }
+
       hls.attachMedia(video)
-      // 先探测路线再 loadSource：直连能通就走直连（手机端几百毫秒），
-      // 不通立刻改走代理。不再让 hls.js 自己耗 15 秒超时才发现要回退。
+      // 先探测路线再 loadSource：直连能通就走直连，不通直接改代理，
+      // 不再让 hls.js 自己耗一个超时周期才发现要回退。
       void (async () => {
         markStage(canDirect ? '探测直连…' : '走代理')
         if (canDirect && !(await probePlaylist(directUrl, DIRECT_PROBE_TIMEOUT_MS))) {
-          usingDirect = false
+          routeIdx = 1
         }
         if (cancelled) return
-        bumpProgress()
-        markStage(usingDirect ? '直连' : '代理')
-        hls.loadSource(usingDirect ? directUrl : proxyUrl)
+        loadRoute()
       })()
       // 每一步有进展就续命，避免慢但正常的加载被误判
-      const onManifest = () => {
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
         bumpProgress()
         markStage('列表 ✓')
-      }
-      hls.on(Hls.Events.MANIFEST_PARSED, onManifest)
+        video.playbackRate = speed
+        video.play().catch(() => setNeedsTap(true))
+      })
       hls.on(Hls.Events.LEVEL_LOADED, bumpProgress)
       hls.on(Hls.Events.FRAG_LOADED, () => {
         bumpProgress()
         markStage('分片 ✓')
       })
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        video.playbackRate = speed
-        video.play().catch(() => setNeedsTap(true))
-      })
-      // 与原生一致：先自恢复两次，仍失败才把错误交给用户（重试 / 换线路）
-      let networkRetries = 0
-      let mediaRetries = 0
       hls.on(Hls.Events.ERROR, (_e, data) => {
         if (!data.fatal) return
         if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          // 直连失败：先回退代理再重试，这一步能救回大多数被墙/被防盗链的源
-          if (usingDirect) {
-            usingDirect = false
-            hls.loadSource(proxyUrl)
-            hls.startLoad()
+          // 分片失败通常只是这一个分片的问题，原地重试更划算；
+          // 换路线等于把已拿到的播放列表整条丢掉重来，白白多等一个超时。
+          if (data.frag) {
+            if (networkRetries++ < 1) {
+              hls.startLoad()
+              return
+            }
+            setPlaybackError(describePlaybackError('network'))
             return
           }
-          if (networkRetries++ < 2) {
-            hls.startLoad()
+          // 播放列表/子列表拿不到 → 横向换路线，再原地重试一轮，最后交给用户
+          routeFails[routeIdx] += 1
+          const alt = nextRoute()
+          if (alt >= 0) {
+            routeIdx = alt
+            loadRoute()
+            return
+          }
+          // 两条都挂过一轮，再从头来一轮；还不行就把错误交给用户（重试 / 换线路）
+          if (retryRounds++ < 1) {
+            routeFails.fill(0)
+            routeIdx = 0
+            loadRoute()
             return
           }
           setPlaybackError(describePlaybackError('network'))
