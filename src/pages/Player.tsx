@@ -20,7 +20,7 @@ import {
 import { offlineVod } from '../lib/downloads'
 import { resolveAdRanges, inRange, type AdRange } from '../lib/ads'
 import { getSettings, PLAYER_SPEED_OPTIONS, useSettings } from '../lib/settings'
-import { BUILD_TAG } from '../lib/version'
+import { BUILD_TAG, hardReload } from '../lib/version'
 import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
@@ -951,6 +951,23 @@ export default function Player() {
         <p className="mt-4 text-body-md text-white/70">
           正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
         </p>
+        {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
+        {elapsedSec >= 8 && (
+          <div className="mt-6 flex gap-3">
+            <button
+              onClick={() => void hardReload()}
+              className="tap rounded-lg bg-white/12 px-4 py-2 text-label-lg text-white"
+            >
+              清理缓存并重试
+            </button>
+            <button
+              onClick={() => navigate(-1)}
+              className="tap rounded-lg bg-white/8 px-4 py-2 text-label-lg text-white/80"
+            >
+              返回
+            </button>
+          </div>
+        )}
       </div>
     )
   }
@@ -1066,6 +1083,23 @@ export default function Player() {
           <p className="mt-4 text-body-md text-white/70">
             正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
           </p>
+          {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
+          {elapsedSec >= 8 && (
+            <div className="pointer-events-auto mt-6 flex gap-3">
+              <button
+                onClick={() => void hardReload()}
+                className="tap rounded-lg bg-white/14 px-4 py-2 text-label-lg text-white"
+              >
+                清理缓存并重试
+              </button>
+              <button
+                onClick={leavePlayer}
+                className="tap rounded-lg bg-white/8 px-4 py-2 text-label-lg text-white/80"
+              >
+                返回
+              </button>
+            </div>
+          )}
         </div>
       )}
 

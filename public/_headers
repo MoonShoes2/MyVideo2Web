@@ -17,6 +17,13 @@
 /manifest.json
   Cache-Control: no-cache, no-store, must-revalidate
 
+# 版本探针与修复页：必须每次回源，否则又把用户卡在旧版本上
+/version.json
+  Cache-Control: no-cache, no-store, must-revalidate
+
+/reset.html
+  Cache-Control: no-cache, no-store, must-revalidate
+
 # 带 hash 的静态资源可以放心长缓存
 /assets/*
   Cache-Control: public, max-age=31536000, immutable

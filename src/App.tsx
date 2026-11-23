@@ -1,5 +1,6 @@
 import { NavLink, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { Icon } from './components/icons'
+import { UpdateBanner } from './components/UpdateBanner'
 import { useDarkMode } from './lib/settings'
 import Home from './pages/Home'
 import Category from './pages/Category'
@@ -80,7 +81,9 @@ export default function App() {
   useDarkMode()
 
   return (
-    <Routes>
+    <>
+      <UpdateBanner />
+      <Routes>
       <Route element={<TabLayout />}>
         <Route path="/" element={<Home />} />
         <Route path="/category" element={<Category />} />
@@ -95,6 +98,7 @@ export default function App() {
       <Route path="/settings" element={<Settings />} />
       <Route path="/cache" element={<CachePage />} />
       <Route path="*" element={<TabLayout />} />
-    </Routes>
+      </Routes>
+    </>
   )
 }

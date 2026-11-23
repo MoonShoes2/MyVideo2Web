@@ -6,6 +6,7 @@ import './index.css'
 import { prunePageCache } from './lib/db'
 import { recoverDownloads } from './lib/downloads'
 import { applyTheme, getSettings } from './lib/settings'
+import { BUILD_ID } from './lib/version'
 
 applyTheme(getSettings().themeMode)
 prunePageCache().catch(() => undefined)
@@ -29,7 +30,8 @@ if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker
       // 版本号：每次改动 sw.js 都升一下，避开边缘缓存导致的「旧 SW 不更新」。
-      .register('/sw.js?v=20261123c')
+      // 版本号用构建号：每次发布都不同，避开边缘缓存导致的「旧 SW 不更新」。
+      .register(`/sw.js?v=${BUILD_ID}`)
       .then((reg) => {
         // 主动检查更新，避免等浏览器按自己的节奏才拉新版本
         reg.update().catch(() => undefined)
