@@ -108,6 +108,12 @@ export default function Player() {
   const [adSkipping, setAdSkipping] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [needsTap, setNeedsTap] = useState(false)
+  // 起播等待秒数：秒数在跳 = 网络在等；秒数冻结 = 主线程卡死（诊断用）
+  const [elapsedSec, setElapsedSec] = useState(0)
+  useEffect(() => {
+    const timer = window.setInterval(() => setElapsedSec((v) => v + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
   const [downloaded, setDownloaded] = useState<Record<number, number[]>>({})
   const [watched, setWatched] = useState<Record<number, Record<number, number>>>({})
 
@@ -894,7 +900,9 @@ export default function Player() {
     return (
       <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black">
         <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
-        <p className="mt-4 text-body-md text-white/70">正在获取播放地址…</p>
+        <p className="mt-4 text-body-md text-white/70">
+          正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s)` : ''}
+        </p>
       </div>
     )
   }
@@ -1007,7 +1015,9 @@ export default function Player() {
       {vod && !firstFrame && !needsTap && !loadError && !playbackError && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center bg-black">
           <span className="h-9 w-9 animate-spin rounded-full border-[3px] border-brand border-t-transparent" />
-          <p className="mt-4 text-body-md text-white/70">正在获取播放地址…</p>
+          <p className="mt-4 text-body-md text-white/70">
+            正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s)` : ''}
+          </p>
         </div>
       )}
 
