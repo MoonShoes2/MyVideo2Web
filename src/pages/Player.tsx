@@ -26,8 +26,8 @@ import { Icon } from '../components/icons'
 import { DownloadedBadge } from '../components/common'
 
 const BOOST_SPEED = 2
-/** 起播硬上限：超过这个时间还没画面就给用户出口，不能无限转圈。 */
-const STARTUP_TIMEOUT_MS = 20_000
+/** 起播无进展上限：连续这么久拿不到任何新数据才判超时（有进展会不断续命）。 */
+const STARTUP_STALL_MS = 20_000
 /** 直连路线探测时长：超时就当直连不通，直接走同源代理。 */
 const DIRECT_PROBE_TIMEOUT_MS = 3_500
 const BOOST_DELAY_MS = 450
@@ -315,14 +315,21 @@ export default function Player() {
     }
     video.addEventListener('loadedmetadata', onMeta, { once: true })
 
-    // 起播看门狗：20 秒还没拿到任何画面数据，就直接给用户可以操作的出口。
-    // 没有它的话，上游一直不返回时会永远停在「正在获取播放地址」（用户说的「卡死」）。
+    // 起播看门狗（心跳式）：只有在「完全没有任何进展」时才判超时。
+    // 直接按固定 20 秒判死会误伤——Cloudflare 回源慢的时候 21 秒才出画面，
+    // 那是真的在推进，不该弹错误。所以任何一步有动静就刷新时间戳。
     let cancelled = false
-    const watchdog = window.setTimeout(() => {
+    let lastProgress = Date.now()
+    const bumpProgress = () => {
+      lastProgress = Date.now()
+    }
+    const watchdog = window.setInterval(() => {
       if (cancelled) return
       if (video.readyState >= 2 || video.currentTime > 0) return
-      setPlaybackError('播放超时，地址可能已失效，试试切换线路')
-    }, STARTUP_TIMEOUT_MS)
+      if (Date.now() - lastProgress > STARTUP_STALL_MS) {
+        setPlaybackError('播放超时，地址可能已失效，试试切换线路')
+      }
+    }, 1000)
 
     if (Hls.isSupported()) {
       const hls = new Hls({
@@ -355,8 +362,13 @@ export default function Player() {
           usingDirect = false
         }
         if (cancelled) return
+        bumpProgress()
         hls.loadSource(usingDirect ? directUrl : proxyUrl)
       })()
+      // 每一步有进展就续命，避免慢但正常的加载被误判
+      hls.on(Hls.Events.MANIFEST_PARSED, bumpProgress)
+      hls.on(Hls.Events.LEVEL_LOADED, bumpProgress)
+      hls.on(Hls.Events.FRAG_LOADED, bumpProgress)
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.playbackRate = speed
         video.play().catch(() => setNeedsTap(true))
@@ -398,7 +410,7 @@ export default function Player() {
 
     return () => {
       cancelled = true
-      window.clearTimeout(watchdog)
+      window.clearInterval(watchdog)
       video.removeEventListener('loadedmetadata', onMeta)
       hlsRef.current?.destroy()
       hlsRef.current = null
