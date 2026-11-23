@@ -449,7 +449,12 @@ export default function Player() {
         }
       })
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = hlsUrl(url)
+      // 原生 HLS（iOS Safari）：<video> 直接吃 m3u8 不需要 CORS，
+      // 所以优先直连 CDN，避免又走一遍慢代理；http 源在 https 页面会被拦。
+      const nativeDirect = toPlayableUrl(url)
+      const useDirect = /^https:/i.test(nativeDirect)
+      markStage(useDirect ? '直连' : '代理')
+      video.src = useDirect ? nativeDirect : hlsUrl(url)
       video.play().catch(() => setNeedsTap(true))
     } else {
       setLoadError('当前浏览器不支持 HLS 播放')
