@@ -113,11 +113,17 @@ export default function Player() {
   const [adSkipping, setAdSkipping] = useState(false)
   const [toast, setToast] = useState<string | null>(null)
   const [needsTap, setNeedsTap] = useState(false)
-  // 起播等待秒数：秒数在跳 = 网络在等；秒数冻结 = 主线程卡死（诊断用）
+  // 起播等待秒数：秒数在跳 = 网络在等；秒数冻结 = 主线程/渲染进程卡死（诊断用）
   const [elapsedSec, setElapsedSec] = useState(0)
   useEffect(() => {
     const timer = window.setInterval(() => setElapsedSec((v) => v + 1), 1000)
     return () => window.clearInterval(timer)
+  }, [])
+  // 起播阶段日志：卡住时把「走到哪一步」显示出来，不用再靠猜。
+  // 日志也不动了 = 进程已经死，而不是网络在等。
+  const [stages, setStages] = useState<string[]>([])
+  const markStage = useCallback((s: string) => {
+    setStages((prev) => (prev[prev.length - 1] === s ? prev : [...prev.slice(-3), s]))
   }, [])
   const [downloaded, setDownloaded] = useState<Record<number, number[]>>({})
   const [watched, setWatched] = useState<Record<number, Record<number, number>>>({})
@@ -245,6 +251,7 @@ export default function Player() {
       setEpisodeIndex(ei)
       setStartPositionMs(sameEpisode && !finished ? history!.positionMs : 0)
       setSpeed(getSettings().defaultSpeed)
+      markStage('详情 ✓')
       setLoading(false)
     })()
     return () => {
@@ -358,17 +365,26 @@ export default function Player() {
       // 先探测路线再 loadSource：直连能通就走直连（手机端几百毫秒），
       // 不通立刻改走代理。不再让 hls.js 自己耗 15 秒超时才发现要回退。
       void (async () => {
+        markStage(canDirect ? '探测直连…' : '走代理')
         if (canDirect && !(await probePlaylist(directUrl, DIRECT_PROBE_TIMEOUT_MS))) {
           usingDirect = false
         }
         if (cancelled) return
         bumpProgress()
+        markStage(usingDirect ? '直连' : '代理')
         hls.loadSource(usingDirect ? directUrl : proxyUrl)
       })()
       // 每一步有进展就续命，避免慢但正常的加载被误判
-      hls.on(Hls.Events.MANIFEST_PARSED, bumpProgress)
+      const onManifest = () => {
+        bumpProgress()
+        markStage('列表 ✓')
+      }
+      hls.on(Hls.Events.MANIFEST_PARSED, onManifest)
       hls.on(Hls.Events.LEVEL_LOADED, bumpProgress)
-      hls.on(Hls.Events.FRAG_LOADED, bumpProgress)
+      hls.on(Hls.Events.FRAG_LOADED, () => {
+        bumpProgress()
+        markStage('分片 ✓')
+      })
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
         video.playbackRate = speed
         video.play().catch(() => setNeedsTap(true))
@@ -446,6 +462,15 @@ export default function Player() {
     const onPlaying = () => {
       setBuffering(false)
       setFirstFrame(true)
+      markStage('首帧 ✓')
+    }
+    // 兜底：媒体已经有首帧数据（loadeddata 已触发）就说明画面可以出来了，
+    // 哪怕 playing 事件因为自动播放被拦等原因没派发，也不能让加载层赖着不走。
+    const onFirstData = () => {
+      if (video.readyState >= 2) {
+        setFirstFrame(true)
+        markStage('首帧 ✓')
+      }
     }
     const onError = () => {
       // hls.js 的致命错误由它自己的 ERROR 事件处理；这里兜底原生 HLS / 直接 mp4。
@@ -459,6 +484,7 @@ export default function Player() {
     video.addEventListener('pause', onPause)
     video.addEventListener('waiting', onWaiting)
     video.addEventListener('playing', onPlaying)
+    video.addEventListener('loadeddata', onFirstData)
     video.addEventListener('error', onError)
     return () => {
       video.removeEventListener('timeupdate', onTime)
@@ -469,6 +495,7 @@ export default function Player() {
       video.removeEventListener('pause', onPause)
       video.removeEventListener('waiting', onWaiting)
       video.removeEventListener('playing', onPlaying)
+      video.removeEventListener('loadeddata', onFirstData)
       video.removeEventListener('error', onError)
     }
   }, [vod])
@@ -963,6 +990,11 @@ export default function Player() {
         <p className="mt-4 text-body-md text-white/70">
           正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
         </p>
+        {elapsedSec > 3 && stages.length > 0 && (
+          <p className="mt-1.5 max-w-[86%] text-center text-[11px] leading-[16px] text-white/35">
+            {stages.join(' · ')}
+          </p>
+        )}
         {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
         {elapsedSec >= 8 && (
           <div className="mt-6 flex gap-3">
@@ -1095,6 +1127,11 @@ export default function Player() {
           <p className="mt-4 text-body-md text-white/70">
             正在获取播放地址…{elapsedSec > 3 ? ` (${elapsedSec}s · ${BUILD_TAG})` : ''}
           </p>
+          {elapsedSec > 3 && stages.length > 0 && (
+            <p className="mt-1.5 max-w-[86%] text-center text-[11px] leading-[16px] text-white/35">
+              {stages.join(' · ')}
+            </p>
+          )}
           {/* 等太久就别让用户干瞪眼：给一个自己动手的出口 */}
           {elapsedSec >= 8 && (
             <div className="pointer-events-auto mt-6 flex gap-3">
