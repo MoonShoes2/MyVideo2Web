@@ -19,7 +19,7 @@ import {
 } from '../lib/parse'
 import { offlineVod } from '../lib/downloads'
 import { resolveAdRanges, inRange, type AdRange } from '../lib/ads'
-import { getSettings, PLAYER_SPEED_OPTIONS, useSettings } from '../lib/settings'
+import { getSettings, PLAYER_SPEED_OPTIONS, updateSettings, useSettings } from '../lib/settings'
 import { BUILD_TAG, hardReload } from '../lib/version'
 import type { PlaySource, Vod } from '../lib/types'
 import { Icon } from '../components/icons'
@@ -178,6 +178,11 @@ export default function Player() {
   // 安装态窗口本身就是全屏，任何额外的 requestFullscreen / orientation.lock
   // 都会引起窗口尺寸变化，正是 PWA 独有的那部分差异。
   const installedPwa = isInstalledPwa()
+  // 自动横屏开关的最新值：hls 回调里读 ref，避免因为设置变化重建播放器
+  const autoRotateRef = useRef(settings.autoRotate)
+  autoRotateRef.current = settings.autoRotate
+  // 安装态下「等首帧再转」的待办标记
+  const pendingRotateRef = useRef(false)
   // 是否真正进入过全屏：比 videoPortrait 更可靠的「横屏播放中」信号，
   // 拿不到视频宽高时也能正确识别系统返回键退出全屏。
   const wasFullscreenRef = useRef(false)
@@ -187,6 +192,13 @@ export default function Player() {
 
   /** 横屏片源转横屏：进全屏 + 锁 landscape（浏览器限制时静默失败）。 */
   const enterLandscape = useCallback(async () => {
+    if (!autoRotateRef.current) return
+    // 安装态：窗口本身已全屏，lock 会真的生效并引起窗口尺寸变化，
+    // 转屏瞬间正好在灌首片会把首帧卡死。所以只记下来，等首帧稳定后再转。
+    if (installedPwa) {
+      pendingRotateRef.current = true
+      return
+    }
     const el = stageRef.current
     // 「网页正常、装成 PWA 就不对」的根源就在这段：
     // 浏览器标签页里 requestFullscreen 会被拒绝，orientation.lock 跟着失败，
@@ -196,7 +208,6 @@ export default function Player() {
     // 正在灌数据的首帧就再也出不来——表现就是「进度条出来了、圈一直转」。
     // PWA 的 manifest 已经是 orientation: any，用户把手机横过来系统自己会转，
     // 完全不需要我们插手。所以安装态一律不转，行为与浏览器标签页一致。
-    if (installedPwa) return
     try {
       if (el && !document.fullscreenElement) await el.requestFullscreen()
       wasFullscreenRef.current = true
@@ -355,6 +366,13 @@ export default function Player() {
       if (cancelled) return
       if (video.readyState >= 2 || video.currentTime > 0) return
       if (Date.now() - lastProgress > STARTUP_STALL_MS) {
+        // 一直起不来时，如果开过自动横屏就先把它关掉——转屏重建渲染表面
+        // 是安装态下最可疑的卡点，关掉后下次进入即可排除这个变量。
+        if (installedPwa && autoRotateRef.current) {
+          pendingRotateRef.current = false
+          updateSettings({ autoRotate: false })
+          showToast('起播超时，已关闭自动横屏，可在设置里重新打开')
+        }
         setPlaybackError('播放超时，地址可能已失效，试试切换线路')
       }
     }, 1000)
@@ -811,7 +829,19 @@ export default function Player() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leavePlayer, videoPortrait, vod, loading, installedPwa])
 
-  // 安装态下没有任何「起播后补转屏」的逻辑：让它跟浏览器一致，跟随设备方向。
+  // 安装态：首帧渲染出来之后再延迟转横屏。
+  // 转屏会让 Android 重建 video 的渲染表面，紧贴起播做会把首帧卡死；
+  // 等画面稳住几百毫秒再转，用户几乎无感，也不会打断解码。
+  useEffect(() => {
+    if (!installedPwa || !firstFrame || !pendingRotateRef.current) return
+    const timer = window.setTimeout(() => {
+      if (!pendingRotateRef.current) return
+      pendingRotateRef.current = false
+      const p = screen.orientation?.lock?.('landscape')
+      if (p && typeof p.catch === 'function') p.catch(() => undefined)
+    }, 900)
+    return () => window.clearTimeout(timer)
+  }, [installedPwa, firstFrame])
 
   // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
   useEffect(() => {
