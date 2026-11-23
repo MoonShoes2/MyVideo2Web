@@ -178,7 +178,6 @@ export default function Player() {
   // 安装态窗口本身就是全屏，任何额外的 requestFullscreen / orientation.lock
   // 都会引起窗口尺寸变化，正是 PWA 独有的那部分差异。
   const installedPwa = isInstalledPwa()
-  const pendingLandscapeRef = useRef(false)
   // 是否真正进入过全屏：比 videoPortrait 更可靠的「横屏播放中」信号，
   // 拿不到视频宽高时也能正确识别系统返回键退出全屏。
   const wasFullscreenRef = useRef(false)
@@ -190,16 +189,14 @@ export default function Player() {
   const enterLandscape = useCallback(async () => {
     const el = stageRef.current
     // 「网页正常、装成 PWA 就不对」的根源就在这段：
-    // 浏览器标签页里 requestFullscreen 会被拒、orientation.lock 也就跟着失败，
-    // 所以什么都没发生；而安装成 PWA 后窗口本身已是全屏，lock 会真的生效——
-    // 它会在「元数据刚就绪、首个分片还在灌」的瞬间把窗口转成横屏，
-    // Android 因此重建 video 的渲染表面，首帧迟迟拿不到，
-    // 表现就是「进度条出来了、圈一直转、永远不进画面」。
-    // 所以安装态先不转，等首帧真正渲染出来再转（见下面的 pendingLandscape 效应）。
-    if (installedPwa) {
-      pendingLandscapeRef.current = true
-      return
-    }
+    // 浏览器标签页里 requestFullscreen 会被拒绝，orientation.lock 跟着失败，
+    // 结果 = 什么都没发生，所以播放正常；
+    // 而安装成 PWA 后窗口本身已经全屏，lock 会**真的生效**，把窗口转成横屏。
+    // 转屏会引起窗口尺寸变化，Android 随之重建 video 的渲染表面，
+    // 正在灌数据的首帧就再也出不来——表现就是「进度条出来了、圈一直转」。
+    // PWA 的 manifest 已经是 orientation: any，用户把手机横过来系统自己会转，
+    // 完全不需要我们插手。所以安装态一律不转，行为与浏览器标签页一致。
+    if (installedPwa) return
     try {
       if (el && !document.fullscreenElement) await el.requestFullscreen()
       wasFullscreenRef.current = true
@@ -814,14 +811,7 @@ export default function Player() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [leavePlayer, videoPortrait, vod, loading, installedPwa])
 
-  // 安装态：首帧真正渲染出来之后才转横屏。
-  // 转屏会重建 video 的渲染表面，放在起播前做会让首帧永远等不到。
-  useEffect(() => {
-    if (!installedPwa || !firstFrame || !pendingLandscapeRef.current) return
-    pendingLandscapeRef.current = false
-    const p = screen.orientation?.lock?.('landscape')
-    if (p && typeof p.catch === 'function') p.catch(() => undefined)
-  }, [installedPwa, firstFrame])
+  // 安装态下没有任何「起播后补转屏」的逻辑：让它跟浏览器一致，跟随设备方向。
 
   // 真正的组件卸载：标记主动离开并收尾全屏/方向锁，避免触发上面的自动返回
   useEffect(() => {
